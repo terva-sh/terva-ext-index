@@ -26,7 +26,7 @@ use sandbox::{Jail, JailError};
 
 /// Kept equal to Cargo.toml's `version` and extension.json's `version` by the
 /// `version_matches_manifests` test below; bump all three together on release.
-const VERSION: &str = "0.3.2";
+const VERSION: &str = "0.3.3";
 
 /// We use the protocol-2 `session_start` event to follow `cwd` across `/cd`
 /// (so the jail tracks the live working directory). That is the lowest host
