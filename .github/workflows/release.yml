@@ -1,0 +1,75 @@
+name: release-build
+
+# Build the standalone binary for the platforms run.sh can fetch, and attach
+# them to the GitHub Release for the pushed tag. Runs ONLY on the public GitHub
+# mirror — the `if` skips it on Forgejo (no macOS runners there). Cut the public
+# tag on the release branch in the mirror to trigger it (see release-process.md).
+#
+# Assets are named by Rust target triple, e.g. terva-ext-index-aarch64-apple-darwin
+# (+ a .sha256), so a future run.sh can map `uname -s`/`uname -m` -> triple and
+# download the matching binary when cargo isn't available to build from source.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: # manual build (no upload — handy for testing the matrix)
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.server_url == 'https://github.com'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-13 }
+          - { target: aarch64-apple-darwin, os: macos-14 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # A C compiler (preinstalled on all the runners) builds the tree-sitter
+      # grammars. Every target here builds natively — no cross-compilation.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: package (binary + sha256)
+        shell: bash
+        run: |
+          out="terva-ext-index-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/terva-ext-index" "$out"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$out" > "$out.sha256"
+          else
+            shasum -a 256 "$out" > "$out.sha256"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: terva-ext-index-${{ matrix.target }}
+          path: |
+            terva-ext-index-${{ matrix.target }}
+            terva-ext-index-${{ matrix.target }}.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.server_url == 'https://github.com' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create/update the release and upload assets
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true

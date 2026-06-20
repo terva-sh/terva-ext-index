@@ -1,0 +1,36 @@
+[package]
+name = "terva-ext-index"
+version = "0.3.2"
+edition = "2021"
+description = "terva index extension: emit a file's tree-sitter skeleton (imports + signatures with exact line ranges) instead of its body"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "terva-ext-index"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-go = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-ruby = "0.23"
+# Markdown: the maintained MDeiml block grammar. Default features only — we use
+# the `LANGUAGE: LanguageFn` const (via tree-sitter-language 0.1, the shared ABI
+# bridge), NOT the optional `parser` feature, so it does not pull a second
+# tree-sitter major into the tree.
+tree-sitter-md = "0.5"
+
+# serde_json is a normal dependency above, so it's already available to the
+# unit and integration tests — no dev-dependency duplicate needed.
+
+[profile.release]
+opt-level = 2
