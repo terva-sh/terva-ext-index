@@ -1,6 +1,6 @@
 [package]
 name = "terva-ext-index"
-version = "0.3.3"
+version = "0.5.0"
 edition = "2021"
 description = "terva index extension: emit a file's tree-sitter skeleton (imports + signatures with exact line ranges) instead of its body"
 license = "MIT"
@@ -28,6 +28,12 @@ tree-sitter-ruby = "0.23"
 # bridge), NOT the optional `parser` feature, so it does not pull a second
 # tree-sitter major into the tree.
 tree-sitter-md = "0.5"
+# Structured-config / data formats (key/section outlines, not code). Same
+# `LANGUAGE: LanguageFn` ABI bridge (tree-sitter-language) as the grammars above,
+# so no second tree-sitter major enters the tree. JSONC/comments are tolerated.
+tree-sitter-json = "0.24"
+tree-sitter-yaml = "0.7"
+tree-sitter-toml-ng = "0.7"
 
 # serde_json is a normal dependency above, so it's already available to the
 # unit and integration tests — no dev-dependency duplicate needed.

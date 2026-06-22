@@ -45,6 +45,9 @@ pub enum Lang {
     Cpp,
     Ruby,
     Markdown,
+    Json,
+    Yaml,
+    Toml,
 }
 
 impl Lang {
@@ -62,6 +65,9 @@ impl Lang {
             "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => Lang::Cpp,
             "rb" => Lang::Ruby,
             "md" | "markdown" => Lang::Markdown,
+            "json" | "jsonc" => Lang::Json,
+            "yaml" | "yml" => Lang::Yaml,
+            "toml" => Lang::Toml,
             _ => return None,
         })
     }
@@ -80,6 +86,9 @@ impl Lang {
             Lang::Cpp => "C++",
             Lang::Ruby => "Ruby",
             Lang::Markdown => "Markdown",
+            Lang::Json => "JSON",
+            Lang::Yaml => "YAML",
+            Lang::Toml => "TOML",
         }
     }
 
@@ -96,6 +105,9 @@ impl Lang {
             Lang::Cpp => tree_sitter_cpp::LANGUAGE.into(),
             Lang::Ruby => tree_sitter_ruby::LANGUAGE.into(),
             Lang::Markdown => tree_sitter_md::LANGUAGE.into(),
+            Lang::Json => tree_sitter_json::LANGUAGE.into(),
+            Lang::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+            Lang::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
         }
     }
 }
@@ -162,19 +174,25 @@ pub fn outline_with_depth(
             bytes: source.len(),
         });
     }
-    let lang = Lang::from_extension(ext).ok_or_else(|| OutlineError::UnsupportedLanguage {
+    // Tree-sitter formats parse to a syntax tree; line-oriented formats have no
+    // grammar and route to a hand-rolled scanner instead — so only the former
+    // builds a parser.
+    if let Some(lang) = Lang::from_extension(ext) {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&lang.ts_language())
+            .map_err(|e| OutlineError::Parser(e.to_string()))?;
+        let tree = parser
+            .parse(source, None)
+            .ok_or_else(|| OutlineError::Parser("parse returned no tree".into()))?;
+        return Ok(render(display_name, lang, &tree, source, max_depth));
+    }
+    if let Some(lf) = LineFormat::from_extension(ext) {
+        return Ok(render_lines(display_name, lf, source));
+    }
+    Err(OutlineError::UnsupportedLanguage {
         ext: ext.to_string(),
-    })?;
-
-    let mut parser = Parser::new();
-    parser
-        .set_language(&lang.ts_language())
-        .map_err(|e| OutlineError::Parser(e.to_string()))?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| OutlineError::Parser("parse returned no tree".into()))?;
-
-    Ok(render(display_name, lang, &tree, source, max_depth))
+    })
 }
 
 /// One emitted declaration line.
@@ -229,39 +247,351 @@ fn render(display_name: &str, lang: Lang, tree: &Tree, src: &[u8], max_depth: us
     }
 
     let mut sink = DeclSink::new();
-    if lang == Lang::Markdown {
+    match lang {
         // Markdown's structure is its headings; collect them directly off
         // heading levels (robust to ATX vs. setext grouping).
-        collect_markdown(root, src, max_depth, &mut sink);
-    } else {
-        let mut cursor = root.walk();
-        for child in root.named_children(&mut cursor) {
-            collect_decls(lang, child, src, 0, max_depth, &mut sink);
+        Lang::Markdown => collect_markdown(root, src, max_depth, &mut sink),
+        // JSON / YAML / TOML structure is the key hierarchy, not code declarations.
+        Lang::Json => collect_json(root, src, max_depth, &mut sink),
+        Lang::Yaml => collect_yaml(root, src, max_depth, &mut sink),
+        Lang::Toml => collect_toml(root, src, max_depth, &mut sink),
+        _ => {
+            let mut cursor = root.walk();
+            for child in root.named_children(&mut cursor) {
+                collect_decls(lang, child, src, 0, max_depth, &mut sink);
+            }
         }
     }
 
+    emit_sink(&mut out, &sink);
+    if imports.is_empty() && sink.lines.is_empty() {
+        out.push_str("  (no imports or top-level declarations found)\n");
+    }
+
+    out
+}
+
+/// Write a `DeclSink`'s lines (range column + indent) and the truncation marker.
+/// Shared by the tree-sitter [`render`] and the line-scanner [`render_lines`].
+fn emit_sink(out: &mut String, sink: &DeclSink) {
     for l in &sink.lines {
         // 1-based inclusive range.
         let range = format!("[{}-{}]", l.start_row + 1, l.end_row + 1);
-        // Pad the range column so signatures line up; two-space base indent
-        // plus one extra level per nesting depth.
+        // Pad the range column so text lines up; two-space base indent plus one
+        // extra level per nesting depth.
         out.push_str("  ");
         for _ in 0..l.indent {
             out.push_str("  ");
         }
         out.push_str(&format!("{range:<10} {}\n", l.text));
     }
-
     if sink.truncated {
         out.push_str(&format!(
-            "  … (output truncated at {MAX_DECL_LINES} declarations — read the file directly for the rest)\n"
+            "  … (output truncated at {MAX_DECL_LINES} entries — read the file directly for the rest)\n"
         ));
     }
-    if imports.is_empty() && sink.lines.is_empty() {
-        out.push_str("  (no imports or top-level declarations found)\n");
+}
+
+// ---------------------------------------------------------------------------
+// Line-oriented formats (no grammar)
+// ---------------------------------------------------------------------------
+
+/// A line-oriented data/config format with no tree-sitter grammar. Recognized by
+/// extension and scanned directly, filling the same [`DeclSink`] the grammar
+/// collectors use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineFormat {
+    /// `.env` / dotenv — KEY NAMES ONLY, values are never emitted.
+    Env,
+    /// `.ini` / `.cfg` / `.conf` — `[section]` headers + key names (no values).
+    Ini,
+    /// `.csv` / `.tsv` — a header + column/row summary, not a per-line outline.
+    Csv,
+    /// `.log` / `.txt` — a line/byte + first/last + severity summary.
+    Log,
+}
+
+impl LineFormat {
+    /// Pick a line format from an extension. The `.env` family has no usable
+    /// extension, so the caller (`main.rs`) normalizes those filenames to `env`
+    /// before dispatch; `*.env` files match here directly too.
+    pub fn from_extension(ext: &str) -> Option<LineFormat> {
+        match ext.to_ascii_lowercase().as_str() {
+            "env" => Some(LineFormat::Env),
+            "ini" | "cfg" | "conf" => Some(LineFormat::Ini),
+            "csv" | "tsv" => Some(LineFormat::Csv),
+            "log" | "txt" => Some(LineFormat::Log),
+            _ => None,
+        }
     }
 
+    /// Human-readable name (stderr diagnostics).
+    pub fn name(self) -> &'static str {
+        match self {
+            LineFormat::Env => "dotenv",
+            LineFormat::Ini => "INI",
+            LineFormat::Csv => "CSV",
+            LineFormat::Log => "log/text",
+        }
+    }
+}
+
+/// Whether `ext` maps to any format `index` can outline (tree-sitter or line).
+/// The single recognition predicate for the directory walk.
+pub fn supported_ext(ext: &str) -> bool {
+    Lang::from_extension(ext).is_some() || LineFormat::from_extension(ext).is_some()
+}
+
+/// The human-readable format name for `ext`, if recognized (stderr diagnostics).
+pub fn format_name(ext: &str) -> Option<&'static str> {
+    Lang::from_extension(ext)
+        .map(Lang::name)
+        .or_else(|| LineFormat::from_extension(ext).map(LineFormat::name))
+}
+
+/// Render a line-oriented format: header, a binary guard, the scanned skeleton,
+/// and a format-specific footer. No parser is built.
+fn render_lines(display_name: &str, lf: LineFormat, src: &[u8]) -> String {
+    let mut out = String::new();
+    out.push_str(display_name);
+    out.push('\n');
+
+    if looks_binary(src) {
+        out.push_str("  (looks binary — use `read`)\n");
+        return out;
+    }
+
+    match lf {
+        LineFormat::Env => {
+            let mut sink = DeclSink::new();
+            collect_env(src, &mut sink);
+            emit_sink(&mut out, &sink);
+            if sink.lines.is_empty() {
+                out.push_str("  (no keys found)\n");
+            } else {
+                out.push_str("  (values omitted — .env may contain secrets)\n");
+            }
+        }
+        LineFormat::Ini => {
+            let mut sink = DeclSink::new();
+            collect_ini(src, &mut sink);
+            emit_sink(&mut out, &sink);
+            if sink.lines.is_empty() {
+                out.push_str("  (no sections or keys found)\n");
+            }
+        }
+        // Summary formats: a fixed structural digest, no per-line ranges.
+        LineFormat::Csv => summarize_csv(&mut out, src),
+        LineFormat::Log => summarize_log(&mut out, src),
+    }
     out
+}
+
+/// `.env` outline: one line per `KEY` — the part left of the first `=`, never
+/// the value. Skips blank lines and `#` comments, and strips a leading `export`.
+/// Emitting only names keeps secrets out of the transcript (a value, or even its
+/// length, can leak entropy), while each `KEY` still carries a `read`-able range.
+fn collect_env(src: &[u8], sink: &mut DeclSink) {
+    let text = String::from_utf8_lossy(src);
+    for (i, line) in text.lines().enumerate() {
+        if sink.full() {
+            return;
+        }
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let t = t.strip_prefix("export ").map(str::trim_start).unwrap_or(t);
+        // Key = text before the first '='. (Lines without '=' are not bindings.)
+        if let Some(eq) = t.find('=') {
+            let key = t[..eq].trim();
+            if !key.is_empty() {
+                sink.push(DeclLine {
+                    start_row: i,
+                    end_row: i,
+                    indent: 0,
+                    text: key.to_string(),
+                });
+            }
+        }
+    }
+}
+
+/// INI / `.cfg` / `.conf` outline: `[section]` headers at the top level (each
+/// spanning to the line before the next section), with key NAMES — the part left
+/// of the first `=` or `:` — nested one level under their section. Values are
+/// omitted (a `.conf` can hold tokens/paths). Comments (`;` / `#`) and blanks are
+/// skipped. These formats have no canonical grammar, so the sectioning is
+/// best-effort; the line ranges are exact regardless.
+fn collect_ini(src: &[u8], sink: &mut DeclSink) {
+    let text = String::from_utf8_lossy(src);
+    let lines: Vec<&str> = text.lines().collect();
+    let section_rows: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| is_ini_section(l))
+        .map(|(i, _)| i)
+        .collect();
+    let last_row = lines.len().saturating_sub(1);
+    let mut in_section = false;
+    for (i, line) in lines.iter().enumerate() {
+        if sink.full() {
+            return;
+        }
+        let t = line.trim();
+        if t.is_empty() || t.starts_with(';') || t.starts_with('#') {
+            continue;
+        }
+        if is_ini_section(line) {
+            in_section = true;
+            // Span to the line before the next section header (mirrors Markdown).
+            let end = section_rows
+                .iter()
+                .find(|&&r| r > i)
+                .map(|&r| r.saturating_sub(1))
+                .unwrap_or(last_row);
+            sink.push(DeclLine {
+                start_row: i,
+                end_row: end.max(i),
+                indent: 0,
+                text: clip(t.to_string()),
+            });
+        } else if let Some(key) = ini_key(t) {
+            sink.push(DeclLine {
+                start_row: i,
+                end_row: i,
+                indent: if in_section { 1 } else { 0 },
+                text: clip(key),
+            });
+        }
+    }
+}
+
+/// A `[section]` header line.
+fn is_ini_section(line: &str) -> bool {
+    let t = line.trim();
+    t.len() > 2 && t.starts_with('[') && t.ends_with(']')
+}
+
+/// The key name of an INI assignment — text before the first `=` or `:` — or
+/// `None` if the line isn't an assignment.
+fn ini_key(line: &str) -> Option<String> {
+    let sep = line.find(['=', ':'])?;
+    let key = line[..sep].trim();
+    (!key.is_empty()).then(|| key.to_string())
+}
+
+/// CSV / TSV summary (NOT a per-line outline): the header row + column count and
+/// a newline-based row estimate, so the model can target its paging instead of
+/// reading the whole file blind. The delimiter is detected from the first line.
+fn summarize_csv(out: &mut String, src: &[u8]) {
+    let text = String::from_utf8_lossy(src);
+    let first = text.lines().next().unwrap_or("");
+    let (delim, delim_label) = detect_delimiter(first);
+    let cols: Vec<&str> = first.split(delim).collect();
+    let ncol = cols.len();
+    let total = text.lines().count();
+    // A first line that's entirely numeric is data, not a header.
+    let has_header = !first.is_empty() && !cols.iter().all(|c| looks_numeric(c));
+    if has_header {
+        let names = cols.iter().map(|c| c.trim()).collect::<Vec<_>>().join(", ");
+        out.push_str(&format!("  header: {} ({ncol} columns)\n", clip(names)));
+        out.push_str(&format!(
+            "  ~{} rows (delimiter: \"{delim_label}\")\n",
+            total.saturating_sub(1)
+        ));
+    } else {
+        out.push_str(&format!("  header: (none detected) — {ncol} columns\n"));
+        out.push_str(&format!("  ~{total} rows (delimiter: \"{delim_label}\")\n"));
+    }
+    out.push_str("  (~rows is a raw line count; use `read` offset/limit to page)\n");
+}
+
+/// Detect a CSV/TSV delimiter from a line by the most frequent of tab, `;`, `,`;
+/// defaults to comma when none appears (a single column).
+fn detect_delimiter(line: &str) -> (char, &'static str) {
+    let candidates = [
+        ('\t', "\\t", line.matches('\t').count()),
+        (';', ";", line.matches(';').count()),
+        (',', ",", line.matches(',').count()),
+    ];
+    match candidates.iter().max_by_key(|(_, _, n)| *n) {
+        Some(&(ch, label, n)) if n > 0 => (ch, label),
+        _ => (',', ","),
+    }
+}
+
+/// Whether a CSV field parses as a number (used for header detection).
+fn looks_numeric(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty() && t.parse::<f64>().is_ok()
+}
+
+/// Logs / plain-text summary (NOT a per-line outline): line + byte counts, the
+/// first and last non-blank lines with their line numbers, and a scan for a few
+/// severity tokens so the model can `read` straight to a failure instead of
+/// paging blind.
+fn summarize_log(out: &mut String, src: &[u8]) {
+    let text = String::from_utf8_lossy(src);
+    let lines: Vec<&str> = text.lines().collect();
+    out.push_str(&format!(
+        "  lines: {}   bytes: {}\n",
+        lines.len(),
+        human_bytes(src.len())
+    ));
+
+    if let Some((i, l)) = lines.iter().enumerate().find(|(_, l)| !l.trim().is_empty()) {
+        out.push_str(&format!("  first: [{}] {}\n", i + 1, quote_clip(l)));
+    }
+    if let Some((i, l)) = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, l)| !l.trim().is_empty())
+    {
+        out.push_str(&format!("  last:  [{}] {}\n", i + 1, quote_clip(l)));
+    }
+
+    // Single-pass severity scan over a fixed token list.
+    const TOKENS: [&str; 5] = ["ERROR", "WARN", "FATAL", "panic", "Traceback"];
+    let mut counts = [0usize; 5];
+    let mut first_error: Option<usize> = None;
+    for (i, l) in lines.iter().enumerate() {
+        for (k, tok) in TOKENS.iter().enumerate() {
+            if l.contains(tok) {
+                counts[k] += 1;
+                if k == 0 && first_error.is_none() {
+                    first_error = Some(i + 1);
+                }
+            }
+        }
+    }
+    let hits: Vec<String> = TOKENS
+        .iter()
+        .zip(counts.iter())
+        .filter(|(_, &c)| c > 0)
+        .map(|(t, c)| format!("{c} {t}"))
+        .collect();
+    if !hits.is_empty() {
+        out.push_str(&format!("  matches: {}", hits.join(", ")));
+        if let Some(fe) = first_error {
+            out.push_str(&format!("  (first ERROR at [{fe}])"));
+        }
+        out.push('\n');
+    }
+    out.push_str("  (use `read` offset/limit to page through it)\n");
+}
+
+/// A clipped, quoted single line for the log first/last preview.
+fn quote_clip(line: &str) -> String {
+    format!("\"{}\"", clip(line.trim().to_string()))
+}
+
+/// Cheap binary sniff: a NUL byte in the first 8 KB. The hand-rolled scanners
+/// would otherwise emit garbage "keys" for a mis-named binary; tree-sitter
+/// tolerates it implicitly, so this guard is only needed here.
+fn looks_binary(src: &[u8]) -> bool {
+    src.iter().take(8192).any(|&b| b == 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -368,8 +698,8 @@ fn gather_imports(lang: Lang, node: Node, src: &[u8], out: &mut Vec<String>) {
                 }
             }
         }
-        // Markdown has no imports; its structure (headings) is all declarations.
-        Lang::Markdown => {}
+        // Markdown / JSON / YAML / TOML have no imports; structure is all "declarations".
+        Lang::Markdown | Lang::Json | Lang::Yaml | Lang::Toml => {}
     }
 }
 
@@ -527,8 +857,8 @@ fn decl_signature<'a>(
         Lang::C => c_decl(node, kind, src),
         Lang::Cpp => cpp_decl(node, kind, src),
         Lang::Ruby => ruby_decl(node, kind, src),
-        // Markdown is handled by collect_markdown, not this body-descent path.
-        Lang::Markdown => None,
+        // Markdown / JSON / YAML / TOML are handled by their own collectors, not this path.
+        Lang::Markdown | Lang::Json | Lang::Yaml | Lang::Toml => None,
     }
 }
 
@@ -905,6 +1235,385 @@ fn setext_level(node: Node) -> usize {
     1
 }
 
+// --- JSON ------------------------------------------------------------------
+
+/// JSON (and JSONC) outline: the key hierarchy. The root value is one line
+/// (`{object, N keys}` / `[array, N items]` / a scalar); each object key nests
+/// under it carrying the line range of its `key: value` pair, so a follow-up
+/// `read` lands on exactly that entry. Arrays report their length but are not
+/// expanded (a 5000-element array would blow the cap). Scalar values are shown
+/// only when short; a long string is elided to its size so a base64 blob or an
+/// inlined cert never enters the skeleton. `max_depth` caps nesting (0 = root
+/// value only, 1 = + its immediate keys, …), matching the Markdown/code depth
+/// contract. tree-sitter recovers from JSONC comments / trailing commas, so the
+/// key structure survives them.
+fn collect_json(root: Node, src: &[u8], max_depth: usize, sink: &mut DeclSink) {
+    let mut cursor = root.walk();
+    for value in root.named_children(&mut cursor) {
+        if value.kind() == "comment" {
+            continue;
+        }
+        json_value(
+            None,
+            value,
+            value.start_position().row,
+            src,
+            0,
+            max_depth,
+            sink,
+        );
+    }
+}
+
+/// Emit `value` as one `DeclLine` at `depth` (optionally prefixed by `key`, the
+/// raw key text including quotes), descending into object members while depth
+/// budget remains. `start_row` is the row the emitted range starts at — the
+/// enclosing pair's row for a keyed value, so the key line is part of the range.
+fn json_value(
+    key: Option<&str>,
+    value: Node,
+    start_row: usize,
+    src: &[u8],
+    depth: usize,
+    max_depth: usize,
+    sink: &mut DeclSink,
+) {
+    if sink.full() {
+        return;
+    }
+    let prefix = key.map(|k| format!("{k}: ")).unwrap_or_default();
+    let end_row = value.end_position().row;
+    match value.kind() {
+        "object" => {
+            let n = count_named_kind(value, "pair");
+            sink.push(DeclLine {
+                start_row,
+                end_row,
+                indent: depth,
+                text: clip(format!(
+                    "{prefix}{{object, {n} {}}}",
+                    noun(n, "key", "keys")
+                )),
+            });
+            if depth < max_depth {
+                let mut c = value.walk();
+                for pair in value.named_children(&mut c) {
+                    if pair.kind() != "pair" {
+                        continue;
+                    }
+                    if let (Some(k), Some(v)) = (
+                        pair.child_by_field_name("key"),
+                        pair.child_by_field_name("value"),
+                    ) {
+                        let k = text_of(k, src);
+                        json_value(
+                            Some(&k),
+                            v,
+                            pair.start_position().row,
+                            src,
+                            depth + 1,
+                            max_depth,
+                            sink,
+                        );
+                    }
+                }
+            }
+        }
+        "array" => {
+            let n = count_value_children(value);
+            sink.push(DeclLine {
+                start_row,
+                end_row,
+                indent: depth,
+                text: clip(format!("{prefix}[array, {n} {}]", noun(n, "item", "items"))),
+            });
+            // Do not descend into array elements — keep the outline bounded.
+        }
+        _ => {
+            sink.push(DeclLine {
+                start_row,
+                end_row,
+                indent: depth,
+                text: clip(format!("{prefix}{}", json_scalar_hint(value, src))),
+            });
+        }
+    }
+}
+
+/// Short scalars are shown verbatim; a long string is elided to its byte size so
+/// a giant blob never enters the skeleton (and an embedded secret is less likely
+/// to be surfaced in full). Numbers / bools / null are always short literals.
+fn json_scalar_hint(value: Node, src: &[u8]) -> String {
+    let raw = squash_ws(&text_of(value, src));
+    if value.kind() == "string" && raw.chars().count() > 40 {
+        format!(
+            "\"<string, {}>\"",
+            human_bytes(value.end_byte() - value.start_byte())
+        )
+    } else {
+        raw
+    }
+}
+
+/// Count named children of `node` whose kind is exactly `kind`.
+fn count_named_kind(node: Node, kind: &str) -> usize {
+    let mut c = node.walk();
+    node.named_children(&mut c)
+        .filter(|n| n.kind() == kind)
+        .count()
+}
+
+/// Count an array's element values (named children that aren't comments).
+fn count_value_children(node: Node) -> usize {
+    let mut c = node.walk();
+    node.named_children(&mut c)
+        .filter(|n| n.kind() != "comment")
+        .count()
+}
+
+/// Singular/plural noun by count (`1 key`, `3 keys`).
+fn noun(n: usize, one: &'static str, many: &'static str) -> &'static str {
+    if n == 1 {
+        one
+    } else {
+        many
+    }
+}
+
+// --- YAML ------------------------------------------------------------------
+
+/// YAML (and YML) outline: the key hierarchy, the same shape as JSON but over
+/// tree-sitter-yaml's block/flow nodes. Each mapping key is a line — a mapping
+/// value shows `{N keys}` and nests, a sequence shows `[N items]` (not
+/// expanded), a scalar shows its value (long strings elided). Multiple `---`
+/// documents are separated by a `--- document N` line. `max_depth` caps nesting,
+/// the same contract as JSON/Markdown/code. Anchors/aliases are shown as written,
+/// not resolved.
+fn collect_yaml(root: Node, src: &[u8], max_depth: usize, sink: &mut DeclSink) {
+    let mut c = root.walk();
+    let docs: Vec<Node> = root
+        .named_children(&mut c)
+        .filter(|n| n.kind() == "document")
+        .collect();
+    let multi = docs.len() > 1;
+    for (i, doc) in docs.iter().enumerate() {
+        if sink.full() {
+            return;
+        }
+        if multi {
+            sink.push(DeclLine {
+                start_row: doc.start_position().row,
+                end_row: doc.end_position().row,
+                indent: 0,
+                text: format!("--- document {}", i + 1),
+            });
+        }
+        if let Some(core) = yaml_core(*doc) {
+            yaml_walk(core, src, 0, max_depth, sink);
+        }
+    }
+}
+
+/// Resolve `document` / `block_node` / `flow_node` wrappers (and skip
+/// anchors/tags/comments) down to the core mapping, sequence, or scalar node.
+fn yaml_core(node: Node) -> Option<Node> {
+    match node.kind() {
+        "document" | "block_node" | "flow_node" => {
+            let mut c = node.walk();
+            let inner = node
+                .named_children(&mut c)
+                .find(|n| !matches!(n.kind(), "anchor" | "tag" | "comment"));
+            inner.and_then(yaml_core)
+        }
+        _ => Some(node),
+    }
+}
+
+/// Walk a core YAML node at `depth`: mapping → one line per key (descending into
+/// nested mappings), sequence/scalar at the top level → a single line.
+fn yaml_walk(core: Node, src: &[u8], depth: usize, max_depth: usize, sink: &mut DeclSink) {
+    match core.kind() {
+        "block_mapping" | "flow_mapping" => {
+            let mut c = core.walk();
+            for pair in core.named_children(&mut c) {
+                if sink.full() {
+                    return;
+                }
+                if !matches!(pair.kind(), "block_mapping_pair" | "flow_pair") {
+                    continue;
+                }
+                let key = pair.child_by_field_name("key");
+                let value = pair.child_by_field_name("value");
+                let key_text = key.map(|k| squash_ws(&text_of(k, src))).unwrap_or_default();
+                let start_row = pair.start_position().row;
+                let end_row = tight_end_row(value.unwrap_or(pair));
+                let vcore = value.and_then(yaml_core);
+                match vcore.map(|n| n.kind()) {
+                    Some("block_mapping") | Some("flow_mapping") => {
+                        let vcore = vcore.unwrap();
+                        let n = count_mapping_pairs(vcore);
+                        sink.push(DeclLine {
+                            start_row,
+                            end_row,
+                            indent: depth,
+                            text: clip(format!("{key_text}: {{{n} {}}}", noun(n, "key", "keys"))),
+                        });
+                        if depth < max_depth {
+                            yaml_walk(vcore, src, depth + 1, max_depth, sink);
+                        }
+                    }
+                    Some("block_sequence") | Some("flow_sequence") => {
+                        let n = count_value_children(vcore.unwrap());
+                        sink.push(DeclLine {
+                            start_row,
+                            end_row,
+                            indent: depth,
+                            text: clip(format!("{key_text}: [{n} {}]", noun(n, "item", "items"))),
+                        });
+                    }
+                    _ => {
+                        let text = match value {
+                            Some(v) => format!("{key_text}: {}", yaml_scalar_hint(v, src)),
+                            None => format!("{key_text}:"),
+                        };
+                        sink.push(DeclLine {
+                            start_row,
+                            end_row,
+                            indent: depth,
+                            text: clip(text),
+                        });
+                    }
+                }
+            }
+        }
+        "block_sequence" | "flow_sequence" => {
+            let n = count_value_children(core);
+            sink.push(DeclLine {
+                start_row: core.start_position().row,
+                end_row: tight_end_row(core),
+                indent: depth,
+                text: clip(format!("[{n} {}]", noun(n, "item", "items"))),
+            });
+        }
+        _ => {
+            sink.push(DeclLine {
+                start_row: core.start_position().row,
+                end_row: tight_end_row(core),
+                indent: depth,
+                text: clip(yaml_scalar_hint(core, src)),
+            });
+        }
+    }
+}
+
+/// Count a YAML mapping's key/value pairs (block or flow).
+fn count_mapping_pairs(mapping: Node) -> usize {
+    let mut c = mapping.walk();
+    mapping
+        .named_children(&mut c)
+        .filter(|n| matches!(n.kind(), "block_mapping_pair" | "flow_pair"))
+        .count()
+}
+
+/// Short scalar shown verbatim; a long one is elided to its byte size so a giant
+/// block scalar (or an inlined secret) never enters the skeleton.
+fn yaml_scalar_hint(value: Node, src: &[u8]) -> String {
+    let raw = squash_ws(&text_of(value, src));
+    if raw.chars().count() > 40 {
+        format!(
+            "<string, {}>",
+            human_bytes(value.end_byte() - value.start_byte())
+        )
+    } else {
+        raw
+    }
+}
+
+/// A YAML block node with no closing delimiter absorbs the trailing newline, so
+/// its `end_position` lands at column 0 of the *next* line. Pull such a range
+/// back to the last line that actually holds content, so a follow-up `read`
+/// doesn't include a spurious blank line. (Also used by TOML, whose tables run
+/// to the start of the next table.)
+fn tight_end_row(node: Node) -> usize {
+    let end = node.end_position();
+    if end.column == 0 && end.row > node.start_position().row {
+        end.row - 1
+    } else {
+        end.row
+    }
+}
+
+// --- TOML ------------------------------------------------------------------
+
+/// TOML outline: sections + key names. `[section]` / `[[array.of.tables]]`
+/// headers are the top level; each section's keys nest one level under it. Only
+/// key NAMES are shown, never values, so an embedded token or path can't leak
+/// and the outline stays compact. Bare `key = value` pairs above the first
+/// section are emitted at the top level in source order. `max_depth` 0 =
+/// sections (and top-level bare keys) only; >= 1 also lists each section's keys.
+fn collect_toml(root: Node, src: &[u8], max_depth: usize, sink: &mut DeclSink) {
+    let mut c = root.walk();
+    for child in root.named_children(&mut c) {
+        if sink.full() {
+            return;
+        }
+        match child.kind() {
+            // A bare key above any section header.
+            "pair" => toml_key_line(child, src, 0, sink),
+            "table" | "table_array_element" => {
+                let array = child.kind() == "table_array_element";
+                let name = toml_table_name(child, src);
+                let header = if array {
+                    format!("[[{name}]]")
+                } else {
+                    format!("[{name}]")
+                };
+                sink.push(DeclLine {
+                    start_row: child.start_position().row,
+                    end_row: tight_end_row(child),
+                    indent: 0,
+                    text: clip(header),
+                });
+                if max_depth > 0 {
+                    let mut cc = child.walk();
+                    for entry in child.named_children(&mut cc) {
+                        if sink.full() {
+                            return;
+                        }
+                        if entry.kind() == "pair" {
+                            toml_key_line(entry, src, 1, sink);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The section name of a `[table]` / `[[table_array_element]]` — its first named
+/// child that isn't a `pair` (a bare/dotted/quoted key).
+fn toml_table_name(table: Node, src: &[u8]) -> String {
+    let mut c = table.walk();
+    let name = table.named_children(&mut c).find(|n| n.kind() != "pair");
+    name.map(|n| squash_ws(&text_of(n, src)))
+        .unwrap_or_default()
+}
+
+/// Emit a TOML pair's key NAME only (the value is never shown).
+fn toml_key_line(pair: Node, src: &[u8], depth: usize, sink: &mut DeclSink) {
+    let name = pair
+        .named_child(0)
+        .map(|k| squash_ws(&text_of(k, src)))
+        .unwrap_or_default();
+    sink.push(DeclLine {
+        start_row: pair.start_position().row,
+        end_row: tight_end_row(pair),
+        indent: depth,
+        text: clip(name),
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -964,6 +1673,20 @@ fn clip(s: String) -> String {
     t
 }
 
+/// Short human-readable byte size (`27 B`, `1.1 KB`, `2.4 MB`). Shared by the
+/// directory-mode size hint (`main.rs`) and JSON long-string elision.
+pub(crate) fn human_bytes(n: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    if n < 1024 {
+        format!("{n} B")
+    } else if (n as f64) < MB {
+        format!("{:.1} KB", n as f64 / KB)
+    } else {
+        format!("{:.1} MB", n as f64 / MB)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -974,12 +1697,12 @@ mod tests {
 
     #[test]
     fn unsupported_language() {
-        let err = outline("a.txt", "txt", b"hello").unwrap_err();
+        let err = outline("a.zig", "zig", b"hello").unwrap_err();
         match err {
-            OutlineError::UnsupportedLanguage { ext } => assert_eq!(ext, "txt"),
+            OutlineError::UnsupportedLanguage { ext } => assert_eq!(ext, "zig"),
             other => panic!("expected unsupported, got {other:?}"),
         }
-        assert!(err_text("a.txt", "txt", b"x").contains("Fall back to `read`"));
+        assert!(err_text("a.zig", "zig", b"x").contains("Fall back to `read`"));
     }
 
     fn err_text(name: &str, ext: &str, src: &[u8]) -> String {
@@ -1451,5 +2174,392 @@ end
         let sk = outline_with_depth("doc.markdown", "markdown", src.as_bytes(), 2).unwrap();
         assert!(sk.contains("Title"), "{sk}");
         assert!(sk.contains("Subtitle"), "{sk}");
+    }
+
+    const JSON_DOC: &str = r#"{
+  "name": "terva-ext-index",
+  "version": "0.3.3",
+  "dependencies": {
+    "tree-sitter": "0.25",
+    "serde_json": "1"
+  },
+  "keywords": ["cli", "terva", "outline"]
+}
+"#;
+
+    #[test]
+    fn json_extension_mapping() {
+        assert_eq!(Lang::from_extension("json"), Some(Lang::Json));
+        assert_eq!(Lang::from_extension("jsonc"), Some(Lang::Json));
+        assert_eq!(Lang::from_extension("JSON"), Some(Lang::Json));
+    }
+
+    #[test]
+    fn json_key_hierarchy_with_ranges() {
+        let sk = outline("package.json", "json", JSON_DOC.as_bytes()).unwrap();
+        // Root object spans the whole file (lines 1-9) with its key count.
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("[1-9]") && l.contains("{object, 4 keys}")),
+            "root object line missing:\n{sk}"
+        );
+        // Short scalars are shown verbatim, each on its own line with a range.
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("[2-2]") && l.contains(r#""name": "terva-ext-index""#)),
+            "name line missing:\n{sk}"
+        );
+        // A nested object is summarized (not expanded) at default depth.
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("[4-7]") && l.contains(r#""dependencies": {object, 2 keys}"#)),
+            "dependencies summary missing:\n{sk}"
+        );
+        // Arrays report length, not elements.
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("[8-8]") && l.contains(r#""keywords": [array, 3 items]"#)),
+            "keywords array line missing:\n{sk}"
+        );
+        // Default depth (1) does NOT expand nested object keys.
+        assert!(
+            !sk.contains(r#""tree-sitter""#),
+            "depth 1 leaked nested keys:\n{sk}"
+        );
+        // No imports line for JSON.
+        assert!(!sk.contains("imports:"), "{sk}");
+    }
+
+    #[test]
+    fn json_depth_controls_nesting() {
+        let top = outline_with_depth("p.json", "json", JSON_DOC.as_bytes(), 0).unwrap();
+        // depth 0 = root value only.
+        assert!(top.contains("{object, 4 keys}"), "{top}");
+        assert!(
+            !top.contains(r#""name""#),
+            "depth 0 should not list keys:\n{top}"
+        );
+
+        let deep = outline_with_depth("p.json", "json", JSON_DOC.as_bytes(), 2).unwrap();
+        assert!(
+            deep.lines()
+                .any(|l| l.contains("[5-5]") && l.contains(r#""tree-sitter": "0.25""#)),
+            "depth 2 should expand nested object keys:\n{deep}"
+        );
+    }
+
+    #[test]
+    fn json_long_string_value_is_elided() {
+        let big = "x".repeat(100);
+        let src = format!("{{\n  \"blob\": \"{big}\",\n  \"ok\": \"short\"\n}}\n");
+        let sk = outline("c.json", "json", src.as_bytes()).unwrap();
+        // The raw value never enters the skeleton...
+        assert!(!sk.contains(&big), "long string value leaked:\n{sk}");
+        // ...it's elided to a size hint instead.
+        assert!(
+            sk.contains(r#""blob": "<string,"#),
+            "elision missing:\n{sk}"
+        );
+        // Short scalars are unaffected.
+        assert!(sk.contains(r#""ok": "short""#), "{sk}");
+    }
+
+    #[test]
+    fn jsonc_comments_and_trailing_comma_tolerated() {
+        let src = "{\n  // the package name\n  \"name\": \"x\",\n  \"version\": \"1\",\n}\n";
+        let sk = outline("tsconfig.jsonc", "jsonc", src.as_bytes()).unwrap();
+        assert!(sk.contains(r#""name": "x""#), "jsonc name dropped:\n{sk}");
+        assert!(
+            sk.contains(r#""version": "1""#),
+            "jsonc version dropped:\n{sk}"
+        );
+    }
+
+    #[test]
+    fn human_bytes_scales() {
+        assert_eq!(human_bytes(27), "27 B");
+        assert_eq!(human_bytes(1024), "1.0 KB");
+        assert_eq!(human_bytes(1536), "1.5 KB");
+        assert_eq!(human_bytes(2 * 1024 * 1024), "2.0 MB");
+    }
+
+    const YAML_DOC: &str = "name: CI\non:\n  push:\n    branches: [main, dev]\njobs:\n  build:\n    runs-on: ubuntu\n  test:\n    needs: build\n";
+
+    #[test]
+    fn yaml_extension_mapping() {
+        assert_eq!(Lang::from_extension("yaml"), Some(Lang::Yaml));
+        assert_eq!(Lang::from_extension("yml"), Some(Lang::Yaml));
+    }
+
+    #[test]
+    fn yaml_key_hierarchy_with_ranges() {
+        let sk = outline("ci.yml", "yml", YAML_DOC.as_bytes()).unwrap();
+        // Top-level scalar shown verbatim.
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("[1-1]") && l.contains("name: CI")),
+            "{sk}"
+        );
+        // A mapping value reports its key count, range spanning the nested block.
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("[2-4]") && l.contains("on: {1 key}")),
+            "{sk}"
+        );
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("[5-9]") && l.contains("jobs: {2 keys}")),
+            "{sk}"
+        );
+        // Nested keys appear at default depth (1).
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("[6-7]") && l.contains("build: {1 key}")),
+            "{sk}"
+        );
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("[8-9]") && l.contains("test: {1 key}")),
+            "{sk}"
+        );
+        // Default depth stops before the third level (branches).
+        assert!(!sk.contains("branches"), "depth 1 leaked deep keys:\n{sk}");
+        assert!(!sk.contains("imports:"), "{sk}");
+    }
+
+    #[test]
+    fn yaml_depth_and_sequence() {
+        let deep = outline_with_depth("ci.yml", "yml", YAML_DOC.as_bytes(), 3).unwrap();
+        // A sequence reports its length, not its elements.
+        assert!(
+            deep.lines().any(|l| l.contains("branches: [2 items]")),
+            "{deep}"
+        );
+        assert!(deep.contains("runs-on: ubuntu"), "{deep}");
+    }
+
+    #[test]
+    fn yaml_multi_document() {
+        let src = "foo: 1\n---\nbar: 2\n";
+        let sk = outline("k8s.yaml", "yaml", src.as_bytes()).unwrap();
+        assert!(sk.contains("--- document 1"), "{sk}");
+        assert!(sk.contains("--- document 2"), "{sk}");
+        assert!(sk.contains("foo: 1"), "{sk}");
+        assert!(sk.contains("bar: 2"), "{sk}");
+    }
+
+    #[test]
+    fn yaml_long_scalar_elided() {
+        let big = "x".repeat(100);
+        let src = format!("token: {big}\nshort: ok\n");
+        let sk = outline("c.yaml", "yaml", src.as_bytes()).unwrap();
+        assert!(!sk.contains(&big), "long scalar leaked:\n{sk}");
+        assert!(sk.contains("token: <string,"), "elision missing:\n{sk}");
+        assert!(sk.contains("short: ok"), "{sk}");
+    }
+
+    const TOML_DOC: &str = "edition = \"2021\"\n\n[package]\nname = \"x\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n\n[[bin]]\nname = \"a\"\n";
+
+    #[test]
+    fn toml_extension_mapping() {
+        assert_eq!(Lang::from_extension("toml"), Some(Lang::Toml));
+        assert_eq!(Lang::from_extension("TOML"), Some(Lang::Toml));
+    }
+
+    #[test]
+    fn toml_sections_and_keys_with_ranges() {
+        let sk = outline("Cargo.toml", "toml", TOML_DOC.as_bytes()).unwrap();
+        // A bare key above the first section is shown at the top level.
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("[1-1]") && l.trim().ends_with("edition")),
+            "{sk}"
+        );
+        // Section header, then its keys nested with their own ranges.
+        assert!(sk.lines().any(|l| l.contains("[package]")), "{sk}");
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("[4-4]") && l.trim().ends_with("name")),
+            "{sk}"
+        );
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("[5-5]") && l.trim().ends_with("version")),
+            "{sk}"
+        );
+        // Array-of-tables header.
+        assert!(sk.lines().any(|l| l.contains("[[bin]]")), "{sk}");
+        // Values are NEVER emitted — only key names.
+        assert!(
+            !sk.contains("0.1.0") && !sk.contains("2021"),
+            "value leaked into TOML outline:\n{sk}"
+        );
+        assert!(!sk.contains("imports:"), "{sk}");
+    }
+
+    #[test]
+    fn toml_depth_zero_is_sections_only() {
+        let top = outline_with_depth("Cargo.toml", "toml", TOML_DOC.as_bytes(), 0).unwrap();
+        assert!(
+            top.contains("[package]") && top.contains("[dependencies]"),
+            "{top}"
+        );
+        // depth 0 lists sections (and top-level bare keys) but not section keys.
+        assert!(
+            !top.lines().any(|l| l.trim() == "name"),
+            "depth 0 leaked section keys:\n{top}"
+        );
+    }
+
+    #[test]
+    fn env_keys_only_never_values() {
+        let src = "# a comment\nDATABASE_URL=postgres://user:secretpass@host/db\n\nexport STRIPE_SECRET_KEY=sk_live_abc123\nREDIS_URL = redis://localhost\n";
+        let sk = outline("env-file", "env", src.as_bytes()).unwrap();
+        // Key names appear, each with a read-able range.
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("[2-2]") && l.trim().ends_with("DATABASE_URL")),
+            "{sk}"
+        );
+        // `export ` is stripped.
+        assert!(
+            sk.lines().any(|l| l.trim().ends_with("STRIPE_SECRET_KEY")),
+            "{sk}"
+        );
+        assert!(sk.lines().any(|l| l.trim().ends_with("REDIS_URL")), "{sk}");
+        // Values are NEVER emitted — not even partially.
+        assert!(!sk.contains("secretpass"), "value leaked:\n{sk}");
+        assert!(!sk.contains("sk_live_abc123"), "secret leaked:\n{sk}");
+        assert!(!sk.contains("redis://localhost"), "value leaked:\n{sk}");
+        // The omission is flagged as deliberate.
+        assert!(sk.contains("values omitted"), "{sk}");
+    }
+
+    #[test]
+    fn env_empty_and_extension() {
+        assert!(LineFormat::from_extension("env").is_some());
+        assert!(supported_ext("env"));
+        let sk = outline(".env", "env", b"\n# only comments\n\n").unwrap();
+        assert!(sk.contains("(no keys found)"), "{sk}");
+        // No "values omitted" note when there are no keys.
+        assert!(!sk.contains("values omitted"), "{sk}");
+    }
+
+    #[test]
+    fn env_binary_is_refused() {
+        let sk = outline(".env", "env", b"KEY=value\x00\x01binary").unwrap();
+        assert!(sk.contains("looks binary"), "{sk}");
+        assert!(!sk.contains("KEY"), "binary content still scanned:\n{sk}");
+    }
+
+    const INI_DOC: &str =
+        "; a comment\nglobal = 1\n\n[server]\nhost = localhost\nport = 8080\n\n[auth]\ntoken = abc\n";
+
+    #[test]
+    fn ini_extension_mapping() {
+        assert_eq!(LineFormat::from_extension("ini"), Some(LineFormat::Ini));
+        assert_eq!(LineFormat::from_extension("cfg"), Some(LineFormat::Ini));
+        assert_eq!(LineFormat::from_extension("conf"), Some(LineFormat::Ini));
+        assert!(supported_ext("ini"));
+    }
+
+    #[test]
+    fn ini_sections_and_keys_with_ranges() {
+        let sk = outline("app.ini", "ini", INI_DOC.as_bytes()).unwrap();
+        // Bare key above the first section, at the top level.
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("[2-2]") && l.trim().ends_with("global")),
+            "{sk}"
+        );
+        // Section header spans to the line before the next section.
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("[4-7]") && l.contains("[server]")),
+            "{sk}"
+        );
+        // Keys nested under the section, each with its own line.
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("[5-5]") && l.trim().ends_with("host")),
+            "{sk}"
+        );
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("[6-6]") && l.trim().ends_with("port")),
+            "{sk}"
+        );
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("[8-9]") && l.contains("[auth]")),
+            "{sk}"
+        );
+        // Values are not shown — only section/key names.
+        assert!(
+            !sk.contains("localhost") && !sk.contains("8080") && !sk.contains("abc"),
+            "value leaked into INI outline:\n{sk}"
+        );
+    }
+
+    #[test]
+    fn csv_summary() {
+        let src = "id,name,email\n1,alice,a@x.com\n2,bob,b@x.com\n";
+        let sk = outline("data.csv", "csv", src.as_bytes()).unwrap();
+        assert!(sk.contains("header: id, name, email (3 columns)"), "{sk}");
+        assert!(sk.contains("~2 rows"), "{sk}");
+        assert!(sk.contains("delimiter: \",\""), "{sk}");
+    }
+
+    #[test]
+    fn tsv_delimiter_and_headerless() {
+        // Tab-separated, and an all-numeric first line → no header detected.
+        let src = "1\t2\t3\n4\t5\t6\n";
+        let sk = outline("d.tsv", "tsv", src.as_bytes()).unwrap();
+        assert!(sk.contains("(none detected) — 3 columns"), "{sk}");
+        assert!(sk.contains("delimiter: \"\\t\""), "{sk}");
+        // No header to subtract: both lines are data.
+        assert!(sk.contains("~2 rows"), "{sk}");
+    }
+
+    #[test]
+    fn log_summary_with_severity() {
+        let src =
+            "=== build started ===\ninfo: compiling\nERROR: missing symbol\nWARN: deprecated\nBUILD FAILED\n";
+        let sk = outline("build.log", "log", src.as_bytes()).unwrap();
+        assert!(sk.contains("lines: 5"), "{sk}");
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("first:") && l.contains("[1]") && l.contains("build started")),
+            "{sk}"
+        );
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("last:") && l.contains("[5]") && l.contains("BUILD FAILED")),
+            "{sk}"
+        );
+        assert!(
+            sk.contains("1 ERROR") && sk.contains("1 WARN"),
+            "severity counts missing:\n{sk}"
+        );
+        assert!(sk.contains("first ERROR at [3]"), "{sk}");
+    }
+
+    #[test]
+    fn txt_plain_summary_has_no_matches_line() {
+        let src = "first line\n\n\nlast line\n";
+        let sk = outline("notes.txt", "txt", src.as_bytes()).unwrap();
+        assert!(sk.contains("lines: 4"), "{sk}");
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("first:") && l.contains("[1]") && l.contains("first line")),
+            "{sk}"
+        );
+        assert!(
+            sk.lines()
+                .any(|l| l.contains("last:") && l.contains("[4]") && l.contains("last line")),
+            "{sk}"
+        );
+        // No severity tokens → no `matches:` line.
+        assert!(!sk.contains("matches:"), "{sk}");
     }
 }

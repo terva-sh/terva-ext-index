@@ -44,21 +44,22 @@ a marker rather than running away.
 
 Pass a **directory** instead of a file to map a whole package in one call —
 every supported source file under it (recursively), each headed by its path
-relative to the directory:
+relative to the directory plus a `(lines, size)` hint so you can tell which
+files are cheap to `read` without a separate `wc -l` / `ls -l`:
 
 ```
 $ index src
 src — 3 supported files
 
-main.rs
+main.rs (412 lines, 11.3 KB)
   imports: ...
   [59-65]  fn main()
   ...
-outline.rs
+outline.rs (965 lines, 33.1 KB)
   imports: tree_sitter::{Node,Parser,Tree}
   [36-47]  pub enum Lang
   ...
-sandbox.rs
+sandbox.rs (120 lines, 3.4 KB)
   ...
 ```
 
@@ -71,7 +72,7 @@ when a tree is larger. `depth` applies per file.
 
 ## Supported languages
 
-Picked by file extension:
+Picked by file extension (or filename, for `.env`):
 
 | Language   | Extensions                                  |
 |------------|---------------------------------------------|
@@ -86,6 +87,13 @@ Picked by file extension:
 | C++        | `.cc`, `.cpp`, `.cxx`, `.hpp`, `.hh`, `.hxx` |
 | Ruby       | `.rb`                                        |
 | Markdown   | `.md`, `.markdown`                           |
+| JSON       | `.json`, `.jsonc`                            |
+| YAML       | `.yaml`, `.yml`                              |
+| TOML       | `.toml`                                      |
+| INI        | `.ini`, `.cfg`, `.conf`                      |
+| dotenv     | `.env`, `.env.*`, `*.env`                    |
+| CSV/TSV    | `.csv`, `.tsv`                               |
+| logs/text  | `.log`, `.txt`                               |
 
 For Markdown the "skeleton" is the document's **headings** — a table of
 contents. Each heading's range spans its whole section (down to the next
@@ -93,6 +101,45 @@ heading of equal-or-higher level), so a follow-up `read` lands on exactly that
 section. `depth` controls how many heading levels deep the TOC goes (`depth: 0`
 = top headings only, `depth: 1` = + one level, …), and `index docs/` gives a
 project-wide doc map in one call.
+
+For JSON (and JSONC) the skeleton is the **key hierarchy**: the root value, then
+each key on its own line carrying the line range of its `key: value` entry — so
+a follow-up `read` lands on exactly that entry. Arrays report their length
+(`[array, N items]`) rather than expanding, a nested object collapses to
+`{object, N keys}` until you raise `depth`, and a long string value is elided to
+its size (`"<string, 1.2 KB>"`) so a base64 blob or inlined cert never enters the
+skeleton. JSONC comments and trailing commas are tolerated.
+
+YAML (`.yaml`/`.yml`) uses the same key-hierarchy shape over block/flow
+mappings: a mapping value shows `{N keys}`, a sequence shows `[N items]`, and
+multiple `---` documents are split with a `--- document N` line.
+
+For TOML the skeleton is its **sections + key names**: `[section]` and
+`[[array.of.tables]]` headers at the top level, each section's keys nested one
+level under it (and bare keys above the first section at the top level). Only
+key **names** are shown, never values — so an embedded token or path can't leak,
+and `index Cargo.toml` is a compact map of the manifest. INI / `.cfg` / `.conf`
+use the same sections + key-names shape via a small line scanner (best-effort
+for non-INI `.conf` dialects; the line ranges are exact regardless).
+
+For `.env` / dotenv files the skeleton is the **variable names only** — the part
+left of the first `=`, each with its line range. Values are **never** emitted
+(not even a type or length), since a `.env` commonly holds secrets; a
+`(values omitted …)` note marks the omission as deliberate. Matched by filename
+(`.env`, `.env.local`, …) and by the `.env` extension, the dotfile members show
+up in a directory walk despite the usual hidden-file skip. A `.env` that looks
+binary is refused with a `use read` message rather than emitting noise.
+
+CSV / TSV files get a **summary** rather than a per-line outline: the header row
+with its column count, a newline-based `~N rows` estimate, and the detected
+delimiter — enough to decide whether and where to `read` without materializing
+the rows. (`~rows` is a raw line count, not an RFC-4180 row count.)
+
+Logs and plain text (`.log`, `.txt`) are summarized too: the line and byte
+counts, the first and last non-blank lines with their line numbers, and a scan
+for a few severity tokens (`ERROR`, `WARN`, `FATAL`, `panic`, `Traceback`) with
+counts and the first `ERROR` line — so the model can `read` straight to a
+failure. A binary file (NUL bytes) is refused rather than summarized as noise.
 
 For any other file type — a file over ~2 MB, one that can't be read, or one
 **outside the workspace** (see [Sandbox](#sandbox)) — the tool returns an

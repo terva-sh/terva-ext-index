@@ -26,7 +26,7 @@ use sandbox::{Jail, JailError};
 
 /// Kept equal to Cargo.toml's `version` and extension.json's `version` by the
 /// `version_matches_manifests` test below; bump all three together on release.
-const VERSION: &str = "0.3.3";
+const VERSION: &str = "0.5.0";
 
 /// We use the protocol-2 `session_start` event to follow `cwd` across `/cd`
 /// (so the jail tracks the live working directory). That is the lowest host
@@ -37,25 +37,32 @@ const MIN_PROTOCOL: i64 = 2;
 /// deep recursion. The output cap still applies on top of this.
 const MAX_DEPTH: u64 = 8;
 
-const TOOL_DESC: &str =
-    "Outline a file's structure — imports + type/function/class signatures with \
-     exact line ranges — or pass a directory to map every supported file under \
-     it (recursively). Optional `depth` (default 1) descends that many nesting \
+const TOOL_DESC: &str = "Outline a file's structure with exact line ranges — code as imports + \
+     type/function/class signatures, JSON/YAML/TOML as their key hierarchy, INI/.env \
+     as key names with values omitted, CSV/logs summarized — or pass a \
+     directory to map every supported file under it (recursively), each with a \
+     (lines, size) hint. Optional `depth` (default 1) descends that many nesting \
      levels — 0 = top-level only, 2+ = members of members. Prefer index before \
      read (~70-90% cheaper); then read offset/limit on the specific range you \
      need. Confined to the workspace; falls back with an error for unsupported, \
      oversized, or out-of-workspace paths.";
 
 const STANDING_CONTEXT: &str =
-    "Prefer `index` before `read`: it returns a file's skeleton (imports + \
-     signatures with exact line ranges) for ~70-90% fewer tokens than a full \
-     read. Use the line range it gives you to follow up with `read` \
-     offset/limit on just the part you need. Supported: Rust, Go, Python, \
-     JavaScript, TypeScript/TSX, Java, C, C++, Ruby, and Markdown (headings as \
-     a table of contents). Pass a directory to map a whole package at once. \
-     `index` is confined to the workspace; for other \
-     file types, files over ~2 MB, or files outside the project, it returns an \
-     error telling you to use `read`.";
+    "Prefer `index` before `read`: it returns a file's skeleton with exact line \
+     ranges for ~70-90% fewer tokens than a full read. Use the line range it \
+     gives you to follow up with `read` offset/limit on just the part you need. \
+     Supported: Rust, Go, Python, JavaScript, TypeScript/TSX, Java, C, C++, Ruby \
+     (imports + signatures), Markdown (headings as a table of contents), \
+     JSON/YAML (key hierarchy with array/sequence lengths; long values elided), \
+     TOML/INI (sections + key names), .env (key names only — values never \
+     shown), CSV/TSV (header + column/row summary), and logs/text (line counts + \
+     first/last line + severity scan). Pass a directory to map a \
+     whole package at \
+     once, each file tagged with its \
+     (lines, size). \
+     `index` is confined to the workspace; for other file types, files over \
+     ~2 MB, or files outside the project, it returns an error telling you to use \
+     `read`.";
 
 fn main() {
     if let Err(e) = run() {
@@ -337,13 +344,13 @@ fn handle_index(path_arg: &str, depth: usize, dirs: &HostDirs) -> (String, bool)
         }
     };
 
-    let ext = canon.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if let Some(lang) = outline::Lang::from_extension(ext) {
-        eprintln!("[index] outlining {} as {}", canon.display(), lang.name());
+    let ext = dispatch_ext(&canon);
+    if let Some(fmt) = outline::format_name(&ext) {
+        eprintln!("[index] outlining {} as {}", canon.display(), fmt);
     }
     let display = display_name(path_arg, &canon);
 
-    match outline::outline_with_depth(&display, ext, &bytes, depth) {
+    match outline::outline_with_depth(&display, &ext, &bytes, depth) {
         Ok(skeleton) => (skeleton, false),
         Err(e) => (e.to_string(), true),
     }
@@ -401,8 +408,19 @@ fn handle_directory(dir: &Path, display: &str, depth: usize) -> (String, bool) {
             _ => continue, // unreadable or grew past the cap: skip, keep going
         };
         let rel = f.strip_prefix(dir).unwrap_or(f);
-        let ext = f.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if let Ok(sk) = outline::outline_with_depth(&rel.to_string_lossy(), ext, &bytes, depth) {
+        let ext = dispatch_ext(f);
+        // Annotate the header with a size hint so the model can tell, in one
+        // call, which files are cheap to `read` — no separate `wc -l` / `ls -l`
+        // round-trip. `bytes.len()` is the true size (read_bounded already
+        // skipped anything over the cap), so both numbers come from the buffer
+        // we already hold.
+        let header = format!(
+            "{} ({} lines, {})",
+            rel.to_string_lossy(),
+            line_count(&bytes),
+            outline::human_bytes(bytes.len())
+        );
+        if let Ok(sk) = outline::outline_with_depth(&header, &ext, &bytes, depth) {
             body.push_str(&sk);
             body.push('\n');
             shown += 1;
@@ -435,8 +453,10 @@ fn collect_source_files(root: &Path, out: &mut Vec<PathBuf>, budget: &mut usize)
         *budget -= 1;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with('.') {
-            continue; // hidden (.git, .venv, dotfiles)
+        // Skip hidden entries, but allowlist the common dotfile configs (`.env`
+        // family) so a directory walk still surfaces them.
+        if name.starts_with('.') && !is_env_basename(&name) {
+            continue; // hidden (.git, .venv, other dotfiles)
         }
         let ft = match entry.file_type() {
             Ok(t) => t,
@@ -451,12 +471,7 @@ fn collect_source_files(root: &Path, out: &mut Vec<PathBuf>, budget: &mut usize)
             }
         } else if ft.is_file() {
             let path = entry.path();
-            if path
-                .extension()
-                .and_then(|e| e.to_str())
-                .and_then(outline::Lang::from_extension)
-                .is_some()
-            {
+            if is_supported(&path) {
                 out.push(path);
             }
         }
@@ -473,6 +488,49 @@ fn read_bounded(path: &Path, max: usize) -> io::Result<Option<Vec<u8>>> {
     } else {
         Ok(Some(buf))
     }
+}
+
+/// Number of lines in `bytes`: the newline count, plus one for a final line
+/// with no trailing newline (so `a\nb` and `a\nb\n` both report 2). An empty
+/// file reports 0.
+fn line_count(bytes: &[u8]) -> usize {
+    let newlines = bytes.iter().filter(|&&b| b == b'\n').count();
+    if bytes.is_empty() || bytes.last() == Some(&b'\n') {
+        newlines
+    } else {
+        newlines + 1
+    }
+}
+
+/// The extension `index` dispatches on. Normally the file extension, but the
+/// `.env` family has no usable one (`.env` has none; `.env.local`'s is `local`),
+/// so those filenames map to `env` — the one place that filename rule lives.
+fn dispatch_ext(path: &Path) -> String {
+    if is_env_name(path) {
+        return "env".to_string();
+    }
+    path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// True for the dotenv family (`.env`, `.env.local`, `.env.production`, …),
+/// matched by filename because the extension is unreliable.
+fn is_env_basename(name: &str) -> bool {
+    name == ".env" || name.starts_with(".env.")
+}
+
+fn is_env_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(is_env_basename)
+        .unwrap_or(false)
+}
+
+/// Whether the directory walk should outline this file.
+fn is_supported(path: &Path) -> bool {
+    outline::supported_ext(&dispatch_ext(path))
 }
 
 /// Join a relative path against the captured cwd; leave absolute paths alone.
@@ -614,7 +672,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(".hidden")).unwrap();
         std::fs::write(dir.join("a.rs"), b"pub fn a() {}\n").unwrap();
         std::fs::write(dir.join("sub/b.py"), b"def b():\n    pass\n").unwrap();
-        std::fs::write(dir.join("notes.txt"), b"unsupported\n").unwrap();
+        std::fs::write(dir.join("notes.bin"), b"\x00unsupported\n").unwrap();
         std::fs::write(dir.join("node_modules/pkg/c.js"), b"function c() {}\n").unwrap();
         std::fs::write(dir.join(".hidden/d.rs"), b"pub fn d() {}\n").unwrap();
 
@@ -626,7 +684,7 @@ mod tests {
         // Relative header for the nested file.
         assert!(text.contains("sub/b.py"), "rel header missing:\n{text}");
         // Excluded: unsupported, node_modules, hidden.
-        assert!(!text.contains("notes.txt"), "unsupported leaked:\n{text}");
+        assert!(!text.contains("notes.bin"), "unsupported leaked:\n{text}");
         assert!(!text.contains("function c"), "node_modules leaked:\n{text}");
         assert!(!text.contains("pub fn d()"), "hidden dir leaked:\n{text}");
         std::fs::remove_dir_all(&dir).ok();
@@ -635,12 +693,73 @@ mod tests {
     #[test]
     fn empty_directory_is_error() {
         let dir = tempdir("emptydir");
-        std::fs::write(dir.join("notes.txt"), b"plain text\n").unwrap(); // unsupported only
-        std::fs::write(dir.join("data.json"), b"{}\n").unwrap();
+        // Extensions outside the supported set (and not on the roadmap).
+        std::fs::write(dir.join("image.png"), b"\x89PNG\r\n").unwrap();
+        std::fs::write(dir.join("data.bin"), b"\x00\x01\x02").unwrap();
         let (text, is_err) = handle_index(".", 1, &dirs_for(Some(dir.clone())));
         assert!(is_err, "{text}");
         assert!(text.contains("no supported source files"), "{text}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn env_name_recognition() {
+        assert!(is_env_basename(".env"));
+        assert!(is_env_basename(".env.local"));
+        assert!(is_env_basename(".env.production"));
+        assert!(!is_env_basename(".envrc"));
+        assert!(!is_env_basename(".gitignore"));
+        assert_eq!(dispatch_ext(Path::new("/p/.env")), "env");
+        assert_eq!(dispatch_ext(Path::new("/p/.env.local")), "env");
+        assert_eq!(dispatch_ext(Path::new("/p/config.env")), "env");
+        assert_eq!(dispatch_ext(Path::new("/p/foo.rs")), "rs");
+    }
+
+    #[test]
+    fn env_file_dispatch_and_walk() {
+        let dir = tempdir("envwalk");
+        std::fs::write(dir.join(".env"), b"SECRET_TOKEN=abc123\nPORT=8080\n").unwrap();
+        std::fs::write(dir.join("a.rs"), b"pub fn a() {}\n").unwrap();
+        // A direct `index .env` works (dotfile bypasses the walk's hidden filter)
+        // and never leaks the value.
+        let (text, is_err) = handle_index(".env", 1, &dirs_for(Some(dir.clone())));
+        assert!(!is_err, "{text}");
+        assert!(
+            text.contains("SECRET_TOKEN") && text.contains("PORT"),
+            "{text}"
+        );
+        assert!(!text.contains("abc123"), "value leaked:\n{text}");
+        // The directory walk surfaces the dotfile config despite the hidden filter.
+        let (dirtext, _) = handle_index(".", 1, &dirs_for(Some(dir.clone())));
+        assert!(dirtext.contains(".env"), "dotfile not in walk:\n{dirtext}");
+        assert!(
+            !dirtext.contains("abc123"),
+            "value leaked in walk:\n{dirtext}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn directory_mode_shows_size_hints() {
+        let dir = tempdir("sizehint");
+        // Two lines, no trailing-newline ambiguity.
+        std::fs::write(dir.join("a.rs"), b"pub fn a() {}\npub fn b() {}\n").unwrap();
+        let (text, is_err) = handle_index(".", 1, &dirs_for(Some(dir.clone())));
+        assert!(!is_err, "{text}");
+        // The file's header line carries `(N lines, X B/KB)`.
+        assert!(
+            text.lines().any(|l| l.starts_with("a.rs (2 lines,")),
+            "size hint missing on header:\n{text}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn line_count_handles_trailing_newline() {
+        assert_eq!(line_count(b""), 0);
+        assert_eq!(line_count(b"a\nb\n"), 2);
+        assert_eq!(line_count(b"a\nb"), 2); // no trailing newline still counts the last line
+        assert_eq!(line_count(b"\n"), 1);
     }
 
     #[test]
