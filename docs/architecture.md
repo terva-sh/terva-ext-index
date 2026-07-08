@@ -20,7 +20,7 @@ tests/wire.rs    E2E    spawns the built binary, drives the real protocol over s
 ```
 
 `outline.rs` and `sandbox.rs` are stdlib-plus-tree-sitter only and carry all the
-interesting invariants; that is where the unit tests live (38 of them).
+interesting invariants; that is where most of the unit tests live (51 of them).
 `main.rs` is deliberately thin — parse a frame, call into the pure modules, emit
 a frame — and is validated end-to-end by `tests/wire.rs` driving the real binary
 over a pipe.
@@ -59,9 +59,12 @@ host                              extension (this binary)
  ├─ shutdown ──────────────────────► shutdown_ack, exit
 ```
 
-Directory requests branch at the `is_dir` check into a bounded, deterministic
-walk (`collect_source_files` → per-file `outline_with_depth`); everything else
-about the loop is identical.
+Directory requests branch at the `is_dir` check into `handle_directory`: a
+bounded, deterministic walk (`collect_source_files`) then a scale-based renderer
+— full skeletons for a package, a flat file map for a larger tree, or a
+child-directory rollup for a very large one (progressive disclosure, so a big
+root is a cheap complete map rather than a firehose of skeletons). Everything
+else about the loop is identical.
 
 ## Why no SDK (yet)
 

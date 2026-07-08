@@ -1,6 +1,6 @@
 [package]
 name = "terva-ext-index"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "terva index extension: emit a file's tree-sitter skeleton (imports + signatures with exact line ranges) instead of its body"
 license = "MIT"

@@ -42,33 +42,71 @@ a marker rather than running away.
 
 ### Directory mode
 
-Pass a **directory** instead of a file to map a whole package in one call —
-every supported source file under it (recursively), each headed by its path
-relative to the directory plus a `(lines, size)` hint so you can tell which
-files are cheap to `read` without a separate `wc -l` / `ls -l`:
+Pass a **directory** instead of a file and `index` maps it with **progressive
+disclosure** — the same structure-before-body idea as the file level, one level
+up. What comes back scales with the tree, so `index <root>` is always a cheap,
+complete map and you drill in only where you look:
 
-```
-$ index src
-src — 3 supported files
+- **A package (≤ 30 supported files)** — the full skeleton of every file, each
+  headed by its path relative to the directory plus a `(lines, size)` hint so
+  you can tell which files are cheap to `read` without a separate `wc -l`/`ls -l`:
 
-main.rs (412 lines, 11.3 KB)
-  imports: ...
-  [59-65]  fn main()
+  ```
+  $ index src
+  src — 3 supported files
+
+  main.rs (412 lines, 11.3 KB)
+    imports: ...
+    [59-65]  fn main()
+    ...
+  outline.rs (965 lines, 33.1 KB)
+    imports: tree_sitter::{Node,Parser,Tree}
+    [36-47]  pub enum Lang
+    ...
+  sandbox.rs (120 lines, 3.4 KB)
+    ...
+  ```
+
+- **A larger tree (≤ 300 supported files)** — a **file map**: one line per file
+  with its `(lines, size)`, no skeleton bodies. Every file is listed (nothing is
+  silently dropped); `index` a file or subdirectory to expand it to skeletons.
+
+  ```
+  $ index .
+  . — 118 supported files in 22 directories
+  (map only — `index <file>` or `index <subdir>` for skeletons)
+
+  cmd/terva/args.go (612 lines, 18.4 KB)
+  cmd/terva/main.go (88 lines, 2.1 KB)
   ...
-outline.rs (965 lines, 33.1 KB)
-  imports: tree_sitter::{Node,Parser,Tree}
-  [36-47]  pub enum Lang
+  ```
+
+- **A very large tree (> 300 supported files)** — a **rollup**: one line per
+  immediate child directory with its file count and total size, so a monorepo
+  root is a ~1–2 KB index. `index <subdir>` descends into any group.
+
+  ```
+  $ index .
+  . — 955 supported files in 48 directories
+  (rolled up — `index <subdir>` to descend)
+
+  cmd/                          14 files  120.0 KB
+  docs/                         40 files  260.0 KB
+  packages/                    620 files    5.9 MB
   ...
-sandbox.rs (120 lines, 3.4 KB)
-  ...
-```
+  ```
+
+The map and rollup tiers ignore `depth` (a file/directory listing has no
+per-file body to deepen), and the rollup reads no file bodies at all — its sizes
+come from the walk's `stat`, so even a huge tree renders in a couple of KB.
+`depth` keeps its per-file meaning on the skeleton tier.
 
 The walk skips hidden entries (`.git`, `.venv`, …), heavy/generated trees
 (`node_modules`, `target`, `vendor`, `dist`, `build`, `__pycache__`, …), and
-symlinks (so it can't loop or escape the workspace). Output is deterministic
-(files are sorted) and bounded: at most 200 files / 256 KB / 20k directory
-entries visited, with a `(showing N; index a subdirectory for the rest)` marker
-when a tree is larger. `depth` applies per file.
+symlinks (so it can't loop or escape the workspace), and is deterministic (files
+are sorted). The skeleton tier keeps a safety backstop of at most 200 files /
+256 KB / 20k directory entries visited; the map and rollup tiers are complete
+and small by construction.
 
 ## Supported languages
 

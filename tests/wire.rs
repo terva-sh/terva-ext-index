@@ -203,6 +203,75 @@ fn handshake_and_tool_call() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A directory over the skeleton threshold comes back as a map (not skeletons)
+/// over the real wire — proves map-first mode is reachable through the protocol.
+#[test]
+fn directory_map_over_wire() {
+    let dir = std::env::temp_dir().join(format!("terva-ext-index-wire-dir-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..40 {
+        std::fs::write(dir.join(format!("f{i:03}.rs")), b"pub fn a() {}\n").unwrap();
+    }
+
+    let mut child = Command::new(bin_path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn binary");
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    // Drain the five startup frames (asserted in the main test).
+    for _ in 0..5 {
+        read_frame(&mut reader);
+    }
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "type": "hello_ack",
+            "protocol_version": 3,
+            "cwd": dir.to_str().unwrap(),
+            "provider": "test",
+            "model": "test"
+        })
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "type": "tool_call",
+            "id": "dir-1",
+            "name": "index",
+            "args": { "path": "." }
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    let result = read_frame(&mut reader);
+    assert_eq!(result["id"], "dir-1");
+    assert_eq!(result["is_error"], false);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("map only"), "expected a map, got:\n{text}");
+    assert!(
+        text.contains("40 supported files"),
+        "count missing:\n{text}"
+    );
+    assert!(!text.contains("pub fn"), "skeleton body leaked:\n{text}");
+
+    writeln!(stdin, "{}", serde_json::json!({ "type": "shutdown" })).unwrap();
+    stdin.flush().unwrap();
+    let ack = read_frame(&mut reader);
+    assert_eq!(ack["type"], "shutdown_ack");
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn read_frame<R: BufRead>(reader: &mut R) -> serde_json::Value {
     let mut line = String::new();
     let n = reader.read_line(&mut line).expect("read frame");

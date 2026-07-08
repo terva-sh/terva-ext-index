@@ -36,9 +36,10 @@ fmt:
 install: build
     #!/usr/bin/env bash
     set -euo pipefail
-    # The install dir is keyed by the source directory basename, not the
-    # manifest name ("index").
-    name="$(basename "$PWD")"
+    # terva (>= v0.109.1) installs under the manifest NAME ("index"), not the
+    # source directory basename — so that's the name `ext remove`/`ext list`
+    # key on (the just-built binary below is still copied in by its repo name).
+    name="index"
     terva ext remove "$name" -y >/dev/null 2>&1 || true
     terva ext install .
     # Install dir is the last column of `ext list`; the path can contain spaces,

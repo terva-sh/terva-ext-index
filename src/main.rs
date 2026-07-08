@@ -17,6 +17,7 @@
 mod outline;
 mod sandbox;
 
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -26,7 +27,7 @@ use sandbox::{Jail, JailError};
 
 /// Kept equal to Cargo.toml's `version` and extension.json's `version` by the
 /// `version_matches_manifests` test below; bump all three together on release.
-const VERSION: &str = "0.5.0";
+const VERSION: &str = "0.6.0";
 
 /// We use the protocol-2 `session_start` event to follow `cwd` across `/cd`
 /// (so the jail tracks the live working directory). That is the lowest host
@@ -40,8 +41,10 @@ const MAX_DEPTH: u64 = 8;
 const TOOL_DESC: &str = "Outline a file's structure with exact line ranges — code as imports + \
      type/function/class signatures, JSON/YAML/TOML as their key hierarchy, INI/.env \
      as key names with values omitted, CSV/logs summarized — or pass a \
-     directory to map every supported file under it (recursively), each with a \
-     (lines, size) hint. Optional `depth` (default 1) descends that many nesting \
+     directory: a small package maps every file's skeleton, while a large tree \
+     returns a file/directory map instead — `index` a specific file or \
+     subdirectory to expand that to skeletons. Optional `depth` (default 1) \
+     descends that many nesting \
      levels — 0 = top-level only, 2+ = members of members. Prefer index before \
      read (~70-90% cheaper); then read offset/limit on the specific range you \
      need. Confined to the workspace; falls back with an error for unsupported, \
@@ -56,10 +59,11 @@ const STANDING_CONTEXT: &str =
      JSON/YAML (key hierarchy with array/sequence lengths; long values elided), \
      TOML/INI (sections + key names), .env (key names only — values never \
      shown), CSV/TSV (header + column/row summary), and logs/text (line counts + \
-     first/last line + severity scan). Pass a directory to map a \
-     whole package at \
-     once, each file tagged with its \
-     (lines, size). \
+     first/last line + severity scan). Pass a directory to map it: a small \
+     package returns every file's skeleton; a large tree returns a \
+     file/directory map instead — then `index` a specific file or subdirectory \
+     to expand it to skeletons, so you never pay for a whole tree's skeletons in \
+     one call. \
      `index` is confined to the workspace; for other file types, files over \
      ~2 MB, or files outside the project, it returns an error telling you to use \
      `read`.";
@@ -364,6 +368,17 @@ const MAX_DIR_FILES: usize = 200; // files actually outlined
 const MAX_DIR_BYTES: usize = 256 * 1024; // total skeleton bytes emitted
 const MAX_WALK_ENTRIES: usize = 20_000; // directory entries visited during the walk
 
+/// Scale thresholds for map-first directory mode (progressive disclosure). At or
+/// below `SKELETON_DIR_FILES` a directory is a "package": emit full skeletons for
+/// every file (the original, unchanged behavior). Above it the result would be a
+/// firehose, so emit a *map* instead — one line per file. Above `MAP_DIR_FILES`
+/// even the flat map is large, so roll it up to one line per immediate child
+/// directory. A map/rollup line is a short size hint, not a skeleton, so its
+/// length is content-independent — a file *count* bounds the output size
+/// accurately, with no need to render-then-measure.
+const SKELETON_DIR_FILES: usize = 30;
+const MAP_DIR_FILES: usize = 300;
+
 /// Directory names we never descend into (heavy / generated trees). Hidden
 /// entries (dotfiles/dirs like .git, .venv) are skipped separately.
 const DENY_DIRS: &[&str] = &[
@@ -378,14 +393,26 @@ const DENY_DIRS: &[&str] = &[
     "obj",
 ];
 
-/// Outline every supported source file under `dir` (recursively), each headed
-/// by its path relative to `dir`. Deterministic (files are sorted) and bounded
-/// by file count, total bytes, and entries visited.
+/// A supported source file found by the walk, tagged with the size we already
+/// stat'd — so the map and rollup renderers reuse it and never re-stat (and the
+/// rollup never reads file bodies at all).
+struct WalkFile {
+    path: PathBuf,
+    size: u64,
+}
+
+/// Map a directory subtree with progressive disclosure. A package-sized
+/// directory (`<= SKELETON_DIR_FILES`) gets full skeletons, exactly as before; a
+/// larger tree gets a *map* (one line per file); a very large tree gets a
+/// *rollup* (one line per immediate child directory). So `index <root>` is
+/// always a cheap, complete index, and you `index <file>` / `index <subdir>` to
+/// expand skeletons only where you look — the file-level structure-before-body
+/// loop, applied one level up.
 fn handle_directory(dir: &Path, display: &str, depth: usize) -> (String, bool) {
     let mut files = Vec::new();
     let mut budget = MAX_WALK_ENTRIES;
     collect_source_files(dir, &mut files, &mut budget);
-    files.sort();
+    files.sort_by(|a, b| a.path.cmp(&b.path));
 
     if files.is_empty() {
         return (
@@ -396,19 +423,37 @@ fn handle_directory(dir: &Path, display: &str, depth: usize) -> (String, bool) {
         );
     }
 
+    // Map and rollup ignore `depth`: a file/directory listing has no per-file
+    // body to deepen, and letting `depth` through would re-inflate exactly the
+    // tier meant to be cheap. `depth` keeps its meaning only on the skeleton path.
+    if files.len() <= SKELETON_DIR_FILES {
+        (render_skeletons(dir, display, depth, &files), false)
+    } else if files.len() <= MAP_DIR_FILES {
+        (render_file_map(dir, display, &files), false)
+    } else {
+        (render_dir_rollup(dir, display, &files), false)
+    }
+}
+
+/// Full-skeleton directory rendering (the original behavior), now used only for
+/// a package-sized directory. Still bounded by `MAX_DIR_FILES` / `MAX_DIR_BYTES`
+/// as a safety backstop: with `files.len() <= SKELETON_DIR_FILES` the file-count
+/// cap never bites, but the byte cap still guards a package of unusually large
+/// files. Output is byte-for-byte what directory mode emitted before map-first.
+fn render_skeletons(dir: &Path, display: &str, depth: usize, files: &[WalkFile]) -> String {
     let total = files.len();
     let mut body = String::new();
     let mut shown = 0usize;
-    for f in &files {
+    for f in files {
         if shown >= MAX_DIR_FILES || body.len() >= MAX_DIR_BYTES {
             break;
         }
-        let bytes = match read_bounded(f, outline::MAX_FILE_BYTES) {
+        let bytes = match read_bounded(&f.path, outline::MAX_FILE_BYTES) {
             Ok(Some(b)) => b,
             _ => continue, // unreadable or grew past the cap: skip, keep going
         };
-        let rel = f.strip_prefix(dir).unwrap_or(f);
-        let ext = dispatch_ext(f);
+        let rel = f.path.strip_prefix(dir).unwrap_or(&f.path);
+        let ext = dispatch_ext(&f.path);
         // Annotate the header with a size hint so the model can tell, in one
         // call, which files are cheap to `read` — no separate `wc -l` / `ls -l`
         // round-trip. `bytes.len()` is the true size (read_bounded already
@@ -428,18 +473,110 @@ fn handle_directory(dir: &Path, display: &str, depth: usize) -> (String, bool) {
     }
 
     let mut out = if shown < total {
-        format!("{display} — {total} supported files (showing {shown}; index a subdirectory for the rest)\n\n")
+        format!("{display} — {total} supported files (showing {shown}; index a specific file or subdirectory for the rest)\n\n")
     } else {
         format!("{display} — {total} supported files\n\n")
     };
     out.push_str(&body);
-    (out, false)
+    out
+}
+
+/// A complete map of every supported file under `dir`: one line each with a
+/// `(lines, size)` hint, no skeleton body. The header tells the model how to
+/// expand it. Reads each file once for the line count (bounded by
+/// `MAP_DIR_FILES`); the byte size comes from the size stat'd during the walk.
+/// Every file is listed — nothing is silently dropped.
+fn render_file_map(dir: &Path, display: &str, files: &[WalkFile]) -> String {
+    let mut out = format!(
+        "{}\n(map only — `index <file>` or `index <subdir>` for skeletons)\n\n",
+        scale_header(dir, display, files),
+    );
+    for f in files {
+        let rel = f.path.strip_prefix(dir).unwrap_or(&f.path);
+        // The line count needs the file's bytes; an unreadable or
+        // >MAX_FILE_BYTES file has none, so show `?` rather than `0` — a bare
+        // `0 lines` next to a multi-MB size reads like an empty file.
+        let lines = match read_bounded(&f.path, outline::MAX_FILE_BYTES) {
+            Ok(Some(b)) => line_count(&b).to_string(),
+            _ => "?".to_string(),
+        };
+        out.push_str(&format!(
+            "{} ({lines} lines, {})\n",
+            rel.to_string_lossy(),
+            outline::human_bytes(f.size as usize),
+        ));
+    }
+    out
+}
+
+/// Roll a large tree up to one line per immediate child (a subdirectory, or a
+/// file sitting directly in `dir`), summing supported-file counts and the bytes
+/// stat'd during the walk. Reads nothing — even a monorepo root renders in a
+/// couple of KB — and `index <child>` descends into any group.
+fn render_dir_rollup(dir: &Path, display: &str, files: &[WalkFile]) -> String {
+    let mut groups: HashMap<String, (usize, u64)> = HashMap::new();
+    for f in files {
+        let rel = f.path.strip_prefix(dir).unwrap_or(&f.path);
+        let mut comps = rel.components();
+        let first = match comps.next() {
+            Some(c) => c.as_os_str().to_string_lossy().into_owned(),
+            None => continue,
+        };
+        // More than one component => the file lives under a subdirectory.
+        let label = if comps.next().is_some() {
+            format!("{first}/")
+        } else {
+            first
+        };
+        let entry = groups.entry(label).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += f.size;
+    }
+    // Deterministic output: HashMap iteration order is unspecified, so sort the
+    // group labels.
+    let mut order: Vec<&String> = groups.keys().collect();
+    order.sort();
+
+    let mut out = format!(
+        "{}\n(rolled up — `index <subdir>` to descend)\n\n",
+        scale_header(dir, display, files),
+    );
+    for label in order {
+        let (count, bytes) = groups[label];
+        let file_word = if count == 1 { "file" } else { "files" };
+        out.push_str(&format!(
+            "{label:<28} {count:>5} {file_word:<5} {}\n",
+            outline::human_bytes(bytes as usize),
+        ));
+    }
+    out
+}
+
+/// The header line shared by the map and rollup tiers: `<display> — N supported
+/// files in M directories`, where M is the number of distinct directories (root
+/// counts as one) that hold a supported file — a cheap scale hint.
+fn scale_header(dir: &Path, display: &str, files: &[WalkFile]) -> String {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for f in files {
+        let rel = f.path.strip_prefix(dir).unwrap_or(&f.path);
+        seen.insert(rel.parent().unwrap_or(Path::new("")).to_path_buf());
+    }
+    let dirs = seen.len();
+    let dir_word = if dirs == 1 {
+        "directory"
+    } else {
+        "directories"
+    };
+    format!(
+        "{display} — {} supported files in {dirs} {dir_word}",
+        files.len()
+    )
 }
 
 /// Recursively collect supported source files under `root`, sorted within each
 /// directory. Skips hidden entries, denied dirs, and symlinks (so the walk
 /// cannot loop or escape the workspace). `budget` bounds total entries visited.
-fn collect_source_files(root: &Path, out: &mut Vec<PathBuf>, budget: &mut usize) {
+fn collect_source_files(root: &Path, out: &mut Vec<WalkFile>, budget: &mut usize) {
     let rd = match std::fs::read_dir(root) {
         Ok(rd) => rd,
         Err(_) => return,
@@ -472,7 +609,10 @@ fn collect_source_files(root: &Path, out: &mut Vec<PathBuf>, budget: &mut usize)
         } else if ft.is_file() {
             let path = entry.path();
             if is_supported(&path) {
-                out.push(path);
+                // One extra stat per supported file, reused by every render
+                // path — the rollup relies on it to avoid reading file bodies.
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                out.push(WalkFile { path, size });
             }
         }
     }
@@ -755,6 +895,93 @@ mod tests {
     }
 
     #[test]
+    fn small_directory_still_emits_skeletons() {
+        let dir = tempdir("smallskel");
+        for i in 0..3 {
+            std::fs::write(dir.join(format!("f{i}.rs")), b"pub fn hello() {}\n").unwrap();
+        }
+        let (text, is_err) = handle_index(".", 1, &dirs_for(Some(dir.clone())));
+        assert!(!is_err, "{text}");
+        // The package case is unchanged: real skeleton bodies, no map/rollup header.
+        assert!(text.contains("pub fn hello()"), "skeleton missing:\n{text}");
+        assert!(
+            !text.contains("map only"),
+            "small dir should not map:\n{text}"
+        );
+        assert!(
+            !text.contains("rolled up"),
+            "small dir should not roll up:\n{text}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn large_directory_returns_a_complete_map() {
+        let dir = tempdir("largemap");
+        // Over SKELETON_DIR_FILES, under MAP_DIR_FILES -> a flat file map.
+        let n = SKELETON_DIR_FILES + 10;
+        for i in 0..n {
+            std::fs::write(
+                dir.join(format!("f{i:03}.rs")),
+                b"pub fn a() {}\npub fn b() {}\n",
+            )
+            .unwrap();
+        }
+        let (text, is_err) = handle_index(".", 1, &dirs_for(Some(dir.clone())));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("map only"), "map header missing:\n{text}");
+        // A map carries size hints but no skeleton body.
+        assert!(
+            !text.contains("pub fn"),
+            "skeleton body leaked into map:\n{text}"
+        );
+        assert!(text.contains("f000.rs ("), "file line missing:\n{text}");
+        // Complete: the alphabetically-last file — the one the old
+        // sort-then-cap path could silently drop — is present.
+        assert!(
+            text.contains(&format!("f{:03}.rs (", n - 1)),
+            "last file missing (silent truncation regressed):\n{text}"
+        );
+        // Cheap: a map of ~40 tiny files is a couple of KB, not a firehose.
+        assert!(text.len() < 8 * 1024, "map too big: {} bytes", text.len());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn very_large_directory_rolls_up_by_child_dir() {
+        let dir = tempdir("rollup");
+        std::fs::create_dir_all(dir.join("alpha")).unwrap();
+        std::fs::create_dir_all(dir.join("beta")).unwrap();
+        let n = MAP_DIR_FILES + 20;
+        for i in 0..n {
+            let sub = if i % 2 == 0 { "alpha" } else { "beta" };
+            std::fs::write(
+                dir.join(sub).join(format!("f{i:04}.rs")),
+                b"pub fn a() {}\n",
+            )
+            .unwrap();
+        }
+        // depth: 2 must NOT re-inflate the rollup — it's depth-blind.
+        let (text, is_err) = handle_index(".", 2, &dirs_for(Some(dir.clone())));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("rolled up"), "rollup header missing:\n{text}");
+        // One line per immediate child dir, not per file.
+        assert!(text.contains("alpha/"), "group missing:\n{text}");
+        assert!(text.contains("beta/"), "group missing:\n{text}");
+        assert!(
+            !text.contains("f0000.rs"),
+            "per-file line leaked into rollup:\n{text}"
+        );
+        // Even a 300+ file tree is a couple of KB.
+        assert!(
+            text.len() < 4 * 1024,
+            "rollup too big: {} bytes",
+            text.len()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn line_count_handles_trailing_newline() {
         assert_eq!(line_count(b""), 0);
         assert_eq!(line_count(b"a\nb\n"), 2);
@@ -777,10 +1004,15 @@ mod tests {
             &mut files,
             &mut budget,
         );
-        assert!(files.iter().any(|f| f.ends_with("real.rs")), "{files:?}");
         assert!(
-            !files.iter().any(|f| f.ends_with("link.rs")),
-            "symlink followed: {files:?}"
+            files.iter().any(|f| f.path.ends_with("real.rs")),
+            "{:?}",
+            files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        assert!(
+            !files.iter().any(|f| f.path.ends_with("link.rs")),
+            "symlink followed: {:?}",
+            files.iter().map(|f| &f.path).collect::<Vec<_>>()
         );
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&outside).ok();
