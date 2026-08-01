@@ -44,6 +44,10 @@ pub enum Lang {
     C,
     Cpp,
     Ruby,
+    Shell,
+    Xml,
+    Html,
+    Css,
     Markdown,
     Json,
     Yaml,
@@ -64,6 +68,14 @@ impl Lang {
             "c" | "h" => Lang::C,
             "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => Lang::Cpp,
             "rb" => Lang::Ruby,
+            "sh" | "bash" | "zsh" | "ksh" => Lang::Shell,
+            // Deliberately not `svg`: an SVG is path data, and an outline of it
+            // is a long list of `<path>` that helps nobody.
+            "xml" | "xsd" | "xsl" | "xslt" | "plist" | "csproj" | "props" | "targets" | "wsdl" => {
+                Lang::Xml
+            }
+            "html" | "htm" | "xhtml" => Lang::Html,
+            "css" => Lang::Css,
             "md" | "markdown" => Lang::Markdown,
             "json" | "jsonc" => Lang::Json,
             "yaml" | "yml" => Lang::Yaml,
@@ -85,6 +97,10 @@ impl Lang {
             Lang::C => "C",
             Lang::Cpp => "C++",
             Lang::Ruby => "Ruby",
+            Lang::Shell => "Shell",
+            Lang::Xml => "XML",
+            Lang::Html => "HTML",
+            Lang::Css => "CSS",
             Lang::Markdown => "Markdown",
             Lang::Json => "JSON",
             Lang::Yaml => "YAML",
@@ -104,6 +120,10 @@ impl Lang {
             Lang::C => tree_sitter_c::LANGUAGE.into(),
             Lang::Cpp => tree_sitter_cpp::LANGUAGE.into(),
             Lang::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+            Lang::Shell => tree_sitter_bash::LANGUAGE.into(),
+            Lang::Xml => tree_sitter_xml::LANGUAGE_XML.into(),
+            Lang::Html => tree_sitter_html::LANGUAGE.into(),
+            Lang::Css => tree_sitter_css::LANGUAGE.into(),
             Lang::Markdown => tree_sitter_md::LANGUAGE.into(),
             Lang::Json => tree_sitter_json::LANGUAGE.into(),
             Lang::Yaml => tree_sitter_yaml::LANGUAGE.into(),
@@ -251,6 +271,10 @@ fn render(display_name: &str, lang: Lang, tree: &Tree, src: &[u8], max_depth: us
         // Markdown's structure is its headings; collect them directly off
         // heading levels (robust to ATX vs. setext grouping).
         Lang::Markdown => collect_markdown(root, src, max_depth, &mut sink),
+        // Markup structure is the element tree, not code declarations.
+        Lang::Xml => collect_xml(root, src, max_depth, &mut sink),
+        Lang::Html => collect_html(root, src, max_depth, &mut sink),
+        Lang::Css => collect_css(root, src, max_depth, &mut sink),
         // JSON / YAML / TOML structure is the key hierarchy, not code declarations.
         Lang::Json => collect_json(root, src, max_depth, &mut sink),
         Lang::Yaml => collect_yaml(root, src, max_depth, &mut sink),
@@ -309,6 +333,10 @@ pub enum LineFormat {
     Csv,
     /// `.log` / `.txt` — a line/byte + first/last + severity summary.
     Log,
+    /// `Makefile` / `*.mk` — target names (+ variable names).
+    Make,
+    /// `Dockerfile` / `Containerfile` — build stages and their instructions.
+    Docker,
 }
 
 impl LineFormat {
@@ -321,6 +349,8 @@ impl LineFormat {
             "ini" | "cfg" | "conf" => Some(LineFormat::Ini),
             "csv" | "tsv" => Some(LineFormat::Csv),
             "log" | "txt" => Some(LineFormat::Log),
+            "mk" | "make" => Some(LineFormat::Make),
+            "dockerfile" => Some(LineFormat::Docker),
             _ => None,
         }
     }
@@ -332,6 +362,8 @@ impl LineFormat {
             LineFormat::Ini => "INI",
             LineFormat::Csv => "CSV",
             LineFormat::Log => "log/text",
+            LineFormat::Make => "Makefile",
+            LineFormat::Docker => "Dockerfile",
         }
     }
 }
@@ -380,11 +412,192 @@ fn render_lines(display_name: &str, lf: LineFormat, src: &[u8]) -> String {
                 out.push_str("  (no sections or keys found)\n");
             }
         }
+        LineFormat::Make => {
+            let mut sink = DeclSink::new();
+            collect_make(src, &mut sink);
+            emit_sink(&mut out, &sink);
+            if sink.lines.is_empty() {
+                out.push_str("  (no targets or variables found)\n");
+            }
+        }
+        LineFormat::Docker => {
+            let mut sink = DeclSink::new();
+            collect_docker(src, &mut sink);
+            emit_sink(&mut out, &sink);
+            if sink.lines.is_empty() {
+                out.push_str("  (no instructions found)\n");
+            }
+        }
         // Summary formats: a fixed structural digest, no per-line ranges.
         LineFormat::Csv => summarize_csv(&mut out, src),
         LineFormat::Log => summarize_log(&mut out, src),
     }
     out
+}
+
+/// Makefile outline: one line per **target**, plus variable NAMES.
+///
+/// A target's range runs to the line before the next target, so a follow-up
+/// `read` lands on that recipe. This is the format where an index earns the
+/// most — a long Makefile is a flat list of dozens of targets and finding the
+/// one you want is otherwise a `grep`. Recipe bodies (tab-indented) are never
+/// emitted, and variable values are omitted the same way `.env` omits them.
+fn collect_make(src: &[u8], sink: &mut DeclSink) {
+    let text = String::from_utf8_lossy(src);
+    let lines: Vec<&str> = text.lines().collect();
+    let target_rows: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| make_target(l).is_some())
+        .map(|(i, _)| i)
+        .collect();
+    let last_row = lines.len().saturating_sub(1);
+    for (i, line) in lines.iter().enumerate() {
+        if sink.full() {
+            return;
+        }
+        // A leading tab is a recipe line, never a declaration.
+        if line.starts_with('\t') || line.trim_start().starts_with('#') {
+            continue;
+        }
+        if let Some(target) = make_target(line) {
+            let end = target_rows
+                .iter()
+                .find(|&&r| r > i)
+                .map(|&r| r.saturating_sub(1))
+                .unwrap_or(last_row);
+            sink.push(DeclLine {
+                start_row: i,
+                end_row: end.max(i),
+                indent: 0,
+                text: clip(target),
+            });
+        } else if let Some(name) = make_variable(line) {
+            sink.push(DeclLine {
+                start_row: i,
+                end_row: i,
+                indent: 0,
+                text: clip(format!("{name} =")),
+            });
+        }
+    }
+}
+
+/// A make target line: `name:` / `name: deps` at column 0, excluding `:=`
+/// assignments and `.PHONY`-style lines that are really directives. Returns
+/// `name:` plus its dependency list, which is the useful part of the header.
+fn make_target(line: &str) -> Option<String> {
+    if line.starts_with([' ', '\t']) || line.trim().is_empty() {
+        return None;
+    }
+    let colon = line.find(':')?;
+    // `:=`, `::=`, `?=` are assignments, not targets.
+    if line[colon..].starts_with(":=") || line[colon..].starts_with("::=") {
+        return None;
+    }
+    let name = line[..colon].trim();
+    if name.is_empty() || name.contains('=') {
+        return None;
+    }
+    Some(squash_ws(line.trim_end()))
+}
+
+/// A make variable assignment at column 0 (`FOO = x`, `FOO := x`, `FOO ?= x`),
+/// returning the NAME only.
+fn make_variable(line: &str) -> Option<String> {
+    if line.starts_with([' ', '\t']) {
+        return None;
+    }
+    let eq = line.find('=')?;
+    let name = line[..eq].trim_end_matches([':', '?', '+', '!']).trim();
+    (!name.is_empty() && !name.contains(char::is_whitespace)).then(|| name.to_string())
+}
+
+/// Dockerfile outline: `FROM` lines are the top level (a multi-stage build's
+/// stages), every other instruction nests one level under the stage it belongs
+/// to. `ENV` and `ARG` show NAMES ONLY — a build arg is a classic place for a
+/// token — while the rest show their (clipped) first line, which is what makes
+/// a long `RUN` legible at a glance.
+fn collect_docker(src: &[u8], sink: &mut DeclSink) {
+    const INSTRUCTIONS: [&str; 17] = [
+        "FROM",
+        "RUN",
+        "CMD",
+        "LABEL",
+        "EXPOSE",
+        "ENV",
+        "ADD",
+        "COPY",
+        "ENTRYPOINT",
+        "VOLUME",
+        "USER",
+        "WORKDIR",
+        "ARG",
+        "ONBUILD",
+        "STOPSIGNAL",
+        "HEALTHCHECK",
+        "SHELL",
+    ];
+    let text = String::from_utf8_lossy(src);
+    let lines: Vec<&str> = text.lines().collect();
+    let from_rows: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.trim_start().to_ascii_uppercase().starts_with("FROM "))
+        .map(|(i, _)| i)
+        .collect();
+    let last_row = lines.len().saturating_sub(1);
+    let mut seen_from = false;
+    for (i, line) in lines.iter().enumerate() {
+        if sink.full() {
+            return;
+        }
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let word = t
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        if !INSTRUCTIONS.contains(&word.as_str()) {
+            continue; // a continuation line of the instruction above
+        }
+        if word == "FROM" {
+            seen_from = true;
+            let end = from_rows
+                .iter()
+                .find(|&&r| r > i)
+                .map(|&r| r.saturating_sub(1))
+                .unwrap_or(last_row);
+            sink.push(DeclLine {
+                start_row: i,
+                end_row: end.max(i),
+                indent: 0,
+                text: clip(squash_ws(t)),
+            });
+            continue;
+        }
+        // Values of ENV/ARG are omitted; everything else shows its first line.
+        let text = if word == "ENV" || word == "ARG" {
+            let names: Vec<String> = t
+                .split_whitespace()
+                .skip(1)
+                .map(|tok| tok.split('=').next().unwrap_or(tok).to_string())
+                .filter(|n| !n.is_empty())
+                .collect();
+            format!("{word} {}", names.join(" "))
+        } else {
+            squash_ws(t)
+        };
+        sink.push(DeclLine {
+            start_row: i,
+            end_row: i,
+            indent: usize::from(seen_from),
+            text: clip(text),
+        });
+    }
 }
 
 /// `.env` outline: one line per `KEY` — the part left of the first `=`, never
@@ -698,8 +911,21 @@ fn gather_imports(lang: Lang, node: Node, src: &[u8], out: &mut Vec<String>) {
                 }
             }
         }
-        // Markdown / JSON / YAML / TOML have no imports; structure is all "declarations".
-        Lang::Markdown | Lang::Json | Lang::Yaml | Lang::Toml => {}
+        Lang::Shell => shell_sourced(node, src, out),
+        Lang::Html => html_referenced(node, src, out),
+        Lang::Css => {
+            // `@import url("reset.css")` / `@import "reset.css"`. The grammar
+            // spells a CSS string `string_value`, which `first_string_literal`
+            // does not recognize, so match it directly.
+            if kind == "import_statement" {
+                if let Some(s) = css_first_string(node, src) {
+                    out.push(s);
+                }
+            }
+        }
+        // XML / Markdown / JSON / YAML / TOML have no imports; structure is all
+        // "declarations".
+        Lang::Xml | Lang::Markdown | Lang::Json | Lang::Yaml | Lang::Toml => {}
     }
 }
 
@@ -857,8 +1083,15 @@ fn decl_signature<'a>(
         Lang::C => c_decl(node, kind, src),
         Lang::Cpp => cpp_decl(node, kind, src),
         Lang::Ruby => ruby_decl(node, kind, src),
-        // Markdown / JSON / YAML / TOML are handled by their own collectors, not this path.
-        Lang::Markdown | Lang::Json | Lang::Yaml | Lang::Toml => None,
+        Lang::Shell => shell_decl(node, kind, src),
+        // Markup and data formats are handled by their own collectors, not this path.
+        Lang::Xml
+        | Lang::Html
+        | Lang::Css
+        | Lang::Markdown
+        | Lang::Json
+        | Lang::Yaml
+        | Lang::Toml => None,
     }
 }
 
@@ -892,7 +1125,7 @@ fn go_decl<'a>(node: Node<'a>, kind: &str, src: &[u8]) -> Option<(String, Option
             }
             None
         }
-        "const_declaration" | "var_declaration" => Some((first_line(&text_of(node, src)), None)),
+        "const_declaration" | "var_declaration" => Some((first_line(&node_head(node, src)), None)),
         _ => None,
     }
 }
@@ -921,7 +1154,7 @@ fn rust_decl<'a>(node: Node<'a>, kind: &str, src: &[u8]) -> Option<(String, Opti
             Some((format!("mod {}", name_or(node, src, "name")), body))
         }
         "const_item" | "static_item" | "type_item" => Some((
-            first_line(&text_of(node, src))
+            first_line(&node_head(node, src))
                 .trim_end_matches(';')
                 .to_string(),
             None,
@@ -968,20 +1201,20 @@ fn js_decl<'a>(
             let body = node.child_by_field_name("body");
             Some((signature_before_brace(node, src), body))
         }
-        "type_alias_declaration" => Some((first_line(&text_of(node, src)), None)),
+        "type_alias_declaration" => Some((first_line(&node_head(node, src)), None)),
         "lexical_declaration" | "variable_declaration" => {
             // Only surface a module-level const/let/var when it binds a
             // function/arrow/class — the structurally interesting case.
             // Trivial scalar bindings (`const A = 1`) are noise; skip them.
             if binds_notable_value(node) {
-                Some((first_line(&text_of(node, src)), None))
+                Some((first_line(&node_head(node, src)), None))
             } else {
                 None
             }
         }
         // Inside a class/interface body:
         "public_field_definition" | "property_signature" | "method_signature" => Some((
-            first_line(&text_of(node, src))
+            first_line(&node_head(node, src))
                 .trim_end_matches([';', ','])
                 .to_string(),
             None,
@@ -1031,7 +1264,7 @@ fn java_decl<'a>(node: Node<'a>, kind: &str, src: &[u8]) -> Option<(String, Opti
             Some((signature_before_body(node, src, "body"), None))
         }
         "field_declaration" => Some((
-            first_line(&text_of(node, src))
+            first_line(&node_head(node, src))
                 .trim_end_matches(';')
                 .to_string(),
             None,
@@ -1048,7 +1281,7 @@ fn c_decl<'a>(node: Node<'a>, kind: &str, src: &[u8]) -> Option<(String, Option<
         "declaration" => {
             // Could be a prototype or a global; keep the first line.
             Some((
-                first_line(&text_of(node, src))
+                first_line(&node_head(node, src))
                     .trim_end_matches(';')
                     .to_string(),
                 None,
@@ -1058,7 +1291,7 @@ fn c_decl<'a>(node: Node<'a>, kind: &str, src: &[u8]) -> Option<(String, Option<
             Some((signature_before_brace(node, src), None))
         }
         "type_definition" => Some((
-            first_line(&text_of(node, src))
+            first_line(&node_head(node, src))
                 .trim_end_matches(';')
                 .to_string(),
             None,
@@ -1073,7 +1306,7 @@ fn cpp_decl<'a>(node: Node<'a>, kind: &str, src: &[u8]) -> Option<(String, Optio
     match kind {
         "function_definition" => Some((signature_before_body(node, src, "body"), None)),
         "declaration" | "field_declaration" => Some((
-            first_line(&text_of(node, src))
+            first_line(&node_head(node, src))
                 .trim_end_matches(';')
                 .to_string(),
             None,
@@ -1122,10 +1355,483 @@ fn ruby_signature(node: Node, src: &[u8]) -> String {
     // whole method in.
     if let Some(body) = node.child_by_field_name("body") {
         let start = node.start_byte();
-        let end = body.start_byte();
+        // `body` can start before `node` on a recovered parse; clamp so the
+        // slice can never invert and panic.
+        let end = body.start_byte().clamp(start, start + MAX_SIG_SCAN);
         return squash_ws(&String::from_utf8_lossy(&src[start..end]));
     }
-    first_line(&text_of(node, src))
+    first_line(&node_head(node, src))
+}
+
+// --- Shell -----------------------------------------------------------------
+
+/// Shell outline: `function` definitions, plus top-level variable assignments
+/// as NAMES ONLY.
+///
+/// The name-only rule matters more here than anywhere else — a shell script is
+/// where `export API_KEY=…` actually lives — and it also keeps a linear script
+/// (the common case, with no functions at all) from outlining to nothing:
+/// the assignments are its knobs.
+fn shell_decl<'a>(node: Node<'a>, kind: &str, src: &[u8]) -> Option<(String, Option<Node<'a>>)> {
+    match kind {
+        // Covers both `foo() { … }` and `function foo { … }`. No descent into
+        // the body: a shell function's members are its `local` variables, which
+        // are implementation detail, not structure — unlike a class's methods.
+        // Descending turned a 4-function script into a wall of locals.
+        "function_definition" => Some((format!("{}()", name_or(node, src, "name")), None)),
+        "variable_assignment" => {
+            let name = name_or(node, src, "name");
+            (!name.is_empty()).then(|| (format!("{name}="), None))
+        }
+        // `export FOO=bar` / `declare -r FOO=bar` wrap the assignment in a
+        // command; surface the name the same way rather than the whole line.
+        "declaration_command" => {
+            let mut c = node.walk();
+            let assigned: Vec<String> = node
+                .named_children(&mut c)
+                .filter(|n| n.kind() == "variable_assignment")
+                .map(|n| format!("{}=", name_or(n, src, "name")))
+                .collect();
+            (!assigned.is_empty()).then(|| (assigned.join(" "), None))
+        }
+        _ => None,
+    }
+}
+
+/// `source foo.sh` / `. foo.sh` are shell's imports.
+fn shell_sourced(node: Node, src: &[u8], out: &mut Vec<String>) {
+    if node.kind() != "command" {
+        return;
+    }
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    let name = text_of(name, src);
+    if name != "source" && name != "." {
+        return;
+    }
+    let mut c = node.walk();
+    for arg in node.named_children(&mut c) {
+        if arg.kind() == "command_name" {
+            continue;
+        }
+        let arg = unquote(&squash_ws(&text_of(arg, src)));
+        if !arg.is_empty() {
+            out.push(arg);
+            return; // one path per source command
+        }
+    }
+}
+
+// --- XML / HTML ------------------------------------------------------------
+
+/// XML outline: the **element tree**. Each element is one line carrying its tag,
+/// its attributes, and either a short text value or a child count — the same
+/// shape as the JSON/YAML key hierarchy, and for the same reason: an XML file's
+/// structure *is* its nesting.
+///
+/// Text and attribute values are shown when short, elided when long, and
+/// redacted when the tag or attribute name looks sensitive
+/// ([`is_sensitive_key`]) — a `web.config` connection string or a `settings.xml`
+/// server password is exactly the shape of secret this format carries.
+fn collect_xml(root: Node, src: &[u8], max_depth: usize, sink: &mut DeclSink) {
+    let mut c = root.walk();
+    for child in root.named_children(&mut c) {
+        if child.kind() == "element" {
+            xml_element(child, src, 0, max_depth, sink);
+        }
+    }
+}
+
+fn xml_element(el: Node, src: &[u8], depth: usize, max_depth: usize, sink: &mut DeclSink) {
+    if sink.full() {
+        return;
+    }
+    // STag for `<a>…</a>`, EmptyElemTag for `<a/>`.
+    let mut c = el.walk();
+    let tag = el
+        .named_children(&mut c)
+        .find(|n| matches!(n.kind(), "STag" | "EmptyElemTag"));
+    let Some(tag) = tag else { return };
+    let name = xml_name(tag, src);
+
+    let mut line = format!("<{name}{}>", xml_attributes(tag, src));
+    let mut cc = el.walk();
+    let content = el.named_children(&mut cc).find(|n| n.kind() == "content");
+    let children: Vec<Node> = match content {
+        Some(content) => {
+            let mut c = content.walk();
+            content
+                .named_children(&mut c)
+                .filter(|n| n.kind() == "element")
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    if children.is_empty() {
+        // A leaf's text is the value — `<artifactId>terva</artifactId>` is
+        // useless without it.
+        if let Some(text) = content.and_then(|c| xml_text(c, src)) {
+            let shown = if must_redact(Some(&name), &text) {
+                REDACTED.to_string()
+            } else {
+                elide_long(&text, value_bytes(&text))
+            };
+            line.push(' ');
+            line.push_str(&shown);
+        }
+    } else {
+        line.push_str(&format!(
+            " ({} {})",
+            children.len(),
+            noun(children.len(), "child", "children")
+        ));
+    }
+
+    sink.push(DeclLine {
+        start_row: el.start_position().row,
+        end_row: tight_end_row(el),
+        indent: depth,
+        text: clip(line),
+    });
+    if depth < max_depth {
+        for child in children {
+            xml_element(child, src, depth + 1, max_depth, sink);
+        }
+    }
+}
+
+/// The tag name: a tag node's first `Name` child.
+fn xml_name(tag: Node, src: &[u8]) -> String {
+    let mut c = tag.walk();
+    let name = tag
+        .named_children(&mut c)
+        .find(|n| n.kind() == "Name")
+        .map(|n| text_of(n, src));
+    name.unwrap_or_default()
+}
+
+/// `Attribute(Name, AttValue)` pairs, rendered back as ` k="v"`, with the same
+/// redaction and elision rules as element text.
+fn xml_attributes(tag: Node, src: &[u8]) -> String {
+    let mut out = String::new();
+    let mut c = tag.walk();
+    for attr in tag.named_children(&mut c) {
+        if attr.kind() != "Attribute" {
+            continue;
+        }
+        let mut ac = attr.walk();
+        let parts: Vec<Node> = attr.named_children(&mut ac).collect();
+        let key = parts
+            .iter()
+            .find(|n| n.kind() == "Name")
+            .map(|n| text_of(*n, src))
+            .unwrap_or_default();
+        if key.is_empty() {
+            continue;
+        }
+        let raw = parts
+            .iter()
+            .find(|n| n.kind() == "AttValue")
+            .map(|n| unquote(&squash_ws(&text_of(*n, src))))
+            .unwrap_or_default();
+        let val = if must_redact(Some(&key), &raw) {
+            REDACTED.to_string()
+        } else {
+            elide_long(&raw, raw.len())
+        };
+        out.push_str(&format!(" {key}=\"{val}\""));
+    }
+    out
+}
+
+/// The concatenated non-blank `CharData` of a content node, if any.
+fn xml_text(content: Node, src: &[u8]) -> Option<String> {
+    let mut c = content.walk();
+    let text: String = content
+        .named_children(&mut c)
+        .filter(|n| n.kind() == "CharData")
+        .map(|n| text_of(n, src))
+        .collect();
+    let text = squash_ws(&text);
+    (!text.is_empty()).then_some(text)
+}
+
+/// Shared long-value rule for markup: show it, or elide to a size once it is
+/// past the same 40-character threshold JSON/YAML use.
+fn elide_long(raw: &str, bytes: usize) -> String {
+    if raw.chars().count() > 40 {
+        format!("<{}>", human_bytes(bytes))
+    } else {
+        raw.to_string()
+    }
+}
+
+fn value_bytes(s: &str) -> usize {
+    s.len()
+}
+
+/// Elements that carry no structure of their own — every HTML document has
+/// them and nesting everything two or three levels under `<html><body>` would
+/// mean `depth: 1` showed nothing but `<head>` and `<body>`. Looked *through*,
+/// the way a Python decorator or a JS `export` already is, so a page's real
+/// landmarks land at the top level.
+const HTML_TRANSPARENT: &[&str] = &["html", "head", "body"];
+
+/// HTML outline: the element tree, with `<script src>` / `<link href>` lifted
+/// into the imports line — a page's dependencies, in the same slot every other
+/// language puts them.
+fn collect_html(root: Node, src: &[u8], max_depth: usize, sink: &mut DeclSink) {
+    let mut c = root.walk();
+    for child in root.named_children(&mut c) {
+        html_element(child, src, 0, max_depth, sink);
+    }
+}
+
+fn html_element(el: Node, src: &[u8], depth: usize, max_depth: usize, sink: &mut DeclSink) {
+    if sink.full() {
+        return;
+    }
+    if !matches!(el.kind(), "element" | "script_element" | "style_element") {
+        return;
+    }
+    let mut c = el.walk();
+    let children: Vec<Node> = el
+        .named_children(&mut c)
+        .filter(|n| matches!(n.kind(), "element" | "script_element" | "style_element"))
+        .collect();
+    let name = html_tag_name(el, src);
+
+    if HTML_TRANSPARENT.contains(&name.as_str()) {
+        for child in children {
+            html_element(child, src, depth, max_depth, sink);
+        }
+        return;
+    }
+
+    let mut line = format!("<{name}{}>", html_identifying_attrs(el, src));
+    if !children.is_empty() {
+        line.push_str(&format!(
+            " ({} {})",
+            children.len(),
+            noun(children.len(), "child", "children")
+        ));
+    } else if let Some(text) = html_text(el, src) {
+        // A leaf's text is what makes it findable — `<h1>` and `<title>` are
+        // just noise without it.
+        line.push(' ');
+        line.push_str(&elide_long(&text, text.len()));
+    }
+    sink.push(DeclLine {
+        start_row: el.start_position().row,
+        end_row: html_end_row(el),
+        indent: depth,
+        text: clip(line),
+    });
+    if depth < max_depth {
+        for child in children {
+            html_element(child, src, depth + 1, max_depth, sink);
+        }
+    }
+}
+
+/// The last row an element really occupies.
+///
+/// A void element (`<link>`, `<meta>`, `<img>`) has no end tag, and the grammar
+/// lets its node run on to whatever follows — a `<link>` on line 5 was
+/// reporting `[5-6]`, swallowing the next line. With no `end_tag` child the
+/// element ends where its start tag ends, and ranges are this tool's whole
+/// promise.
+fn html_end_row(el: Node) -> usize {
+    let mut c = el.walk();
+    let has_end = el.named_children(&mut c).any(|n| n.kind() == "end_tag");
+    if has_end {
+        return tight_end_row(el);
+    }
+    html_start_tag(el)
+        .map(|t| t.end_position().row)
+        .unwrap_or_else(|| tight_end_row(el))
+}
+
+/// The element's own text, ignoring descendants (a leaf has no descendants
+/// anyway, and this is only called for leaves).
+fn html_text(el: Node, src: &[u8]) -> Option<String> {
+    let mut c = el.walk();
+    let text: String = el
+        .named_children(&mut c)
+        .filter(|n| matches!(n.kind(), "text" | "raw_text"))
+        .map(|n| text_of(n, src))
+        .collect();
+    let text = squash_ws(&text);
+    (!text.is_empty()).then_some(text)
+}
+
+fn html_start_tag(el: Node) -> Option<Node> {
+    let mut c = el.walk();
+    let tag = el
+        .named_children(&mut c)
+        .find(|n| matches!(n.kind(), "start_tag" | "self_closing_tag"));
+    tag
+}
+
+fn html_tag_name(el: Node, src: &[u8]) -> String {
+    let Some(tag) = html_start_tag(el) else {
+        return String::new();
+    };
+    let mut c = tag.walk();
+    let name = tag
+        .named_children(&mut c)
+        .find(|n| n.kind() == "tag_name")
+        .map(|n| text_of(n, src).to_ascii_lowercase());
+    name.unwrap_or_default()
+}
+
+/// Only the attributes that identify an element (`id`, `class`, `name`, and the
+/// `src`/`href` that make a `<script>`/`<link>` meaningful). A page's real
+/// attributes are mostly styling noise, and the point of the line is to be
+/// findable.
+fn html_identifying_attrs(el: Node, src: &[u8]) -> String {
+    const KEEP: [&str; 5] = ["id", "class", "name", "src", "href"];
+    let Some(tag) = html_start_tag(el) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    let mut c = tag.walk();
+    for attr in tag.named_children(&mut c) {
+        if attr.kind() != "attribute" {
+            continue;
+        }
+        let (Some(k), Some(v)) = (html_attr_name(attr, src), html_attr_value(attr, src)) else {
+            continue;
+        };
+        if KEEP.contains(&k.as_str()) {
+            out.push_str(&format!(" {k}=\"{}\"", elide_long(&v, v.len())));
+        }
+    }
+    out
+}
+
+fn html_attr_name(attr: Node, src: &[u8]) -> Option<String> {
+    let mut c = attr.walk();
+    let name = attr
+        .named_children(&mut c)
+        .find(|n| n.kind() == "attribute_name")
+        .map(|n| text_of(n, src).to_ascii_lowercase());
+    name
+}
+
+fn html_attr_value(attr: Node, src: &[u8]) -> Option<String> {
+    let mut c = attr.walk();
+    let val = attr
+        .named_children(&mut c)
+        .find(|n| matches!(n.kind(), "quoted_attribute_value" | "attribute_value"))
+        .map(|n| unquote(&squash_ws(&text_of(n, src))));
+    val
+}
+
+/// `<script src>` / `<link href>` are an HTML page's imports.
+///
+/// Unlike every other language's import statement these are not top-level —
+/// they sit inside `<head>`, which is inside `<html>` — so this recurses rather
+/// than relying on `collect_imports`'s single pass over the root's children.
+fn html_referenced(node: Node, src: &[u8], out: &mut Vec<String>) {
+    let mut c = node.walk();
+    for child in node.named_children(&mut c) {
+        html_referenced(child, src, out);
+    }
+    let name = html_tag_name(node, src);
+    if name != "script" && name != "link" {
+        return;
+    }
+    let want = if name == "script" { "src" } else { "href" };
+    let Some(tag) = html_start_tag(node) else {
+        return;
+    };
+    let mut c = tag.walk();
+    for attr in tag.named_children(&mut c) {
+        if attr.kind() != "attribute" {
+            continue;
+        }
+        if html_attr_name(attr, src).as_deref() == Some(want) {
+            if let Some(v) = html_attr_value(attr, src) {
+                if !v.is_empty() {
+                    out.push(v);
+                }
+            }
+        }
+    }
+}
+
+// --- CSS -------------------------------------------------------------------
+
+/// CSS outline: the **selector list**. One line per rule set carrying its
+/// selectors and the range of the whole rule, so a follow-up `read` lands on
+/// that block; `@media` / `@supports` / `@keyframes` are their own lines with
+/// their rules nested under them. Property declarations inside a block are not
+/// emitted — the selectors are what you look a stylesheet up by. `@import` goes
+/// to the imports line.
+fn collect_css(root: Node, src: &[u8], max_depth: usize, sink: &mut DeclSink) {
+    css_block(root, src, 0, max_depth, sink);
+}
+
+/// First `string_value` / `plain_value` under `node`, unquoted — the URL of an
+/// `@import`, whether written `url("x.css")` or bare `"x.css"`.
+fn css_first_string(node: Node, src: &[u8]) -> Option<String> {
+    if matches!(node.kind(), "string_value" | "plain_value") {
+        let s = unquote(&squash_ws(&text_of(node, src)));
+        return (!s.is_empty()).then_some(s);
+    }
+    let mut c = node.walk();
+    let kids: Vec<Node> = node.named_children(&mut c).collect();
+    kids.into_iter().find_map(|ch| css_first_string(ch, src))
+}
+
+fn css_block(node: Node, src: &[u8], depth: usize, max_depth: usize, sink: &mut DeclSink) {
+    let mut c = node.walk();
+    for child in node.named_children(&mut c) {
+        if sink.full() {
+            return;
+        }
+        match child.kind() {
+            "rule_set" => {
+                let mut sc = child.walk();
+                let selectors = child
+                    .named_children(&mut sc)
+                    .find(|n| n.kind() == "selectors")
+                    .map(|n| squash_ws(&text_of(n, src)))
+                    .unwrap_or_default();
+                sink.push(DeclLine {
+                    start_row: child.start_position().row,
+                    end_row: tight_end_row(child),
+                    indent: depth,
+                    text: clip(selectors),
+                });
+            }
+            // At-rules that hold nested rules: emit the header, then descend.
+            "media_statement" | "supports_statement" | "keyframes_statement" => {
+                sink.push(DeclLine {
+                    start_row: child.start_position().row,
+                    end_row: tight_end_row(child),
+                    indent: depth,
+                    text: clip(
+                        first_line(&node_head(child, src))
+                            .trim_end_matches('{')
+                            .trim()
+                            .to_string(),
+                    ),
+                });
+                if depth < max_depth {
+                    let mut bc = child.walk();
+                    for block in child.named_children(&mut bc) {
+                        if block.kind() == "block" {
+                            css_block(block, src, depth + 1, max_depth, sink);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 // --- Markdown --------------------------------------------------------------
@@ -1195,7 +1901,7 @@ fn gather_headings(node: Node, src: &[u8], out: &mut Vec<MdHeading>) {
             out.push(MdHeading {
                 level: setext_level(node),
                 start_row: node.start_position().row,
-                text: first_line(&text_of(node, src)),
+                text: first_line(&node_head(node, src)),
             });
             return;
         }
@@ -1334,17 +2040,20 @@ fn json_value(
                 start_row,
                 end_row,
                 indent: depth,
-                text: clip(format!("{prefix}{}", json_scalar_hint(value, src))),
+                text: clip(format!("{prefix}{}", json_scalar_hint(key, value, src))),
             });
         }
     }
 }
 
 /// Short scalars are shown verbatim; a long string is elided to its byte size so
-/// a giant blob never enters the skeleton (and an embedded secret is less likely
-/// to be surfaced in full). Numbers / bools / null are always short literals.
-fn json_scalar_hint(value: Node, src: &[u8]) -> String {
+/// a giant blob never enters the skeleton. A value under a **sensitive key name**
+/// is redacted whatever its length — see [`is_sensitive_key`].
+fn json_scalar_hint(key: Option<&str>, value: Node, src: &[u8]) -> String {
     let raw = squash_ws(&text_of(value, src));
+    if must_redact(key, &raw) {
+        return REDACTED.to_string();
+    }
     if value.kind() == "string" && raw.chars().count() > 40 {
         format!(
             "\"<string, {}>\"",
@@ -1353,6 +2062,125 @@ fn json_scalar_hint(value: Node, src: &[u8]) -> String {
     } else {
         raw
     }
+}
+
+/// What a redacted value renders as. Deliberately carries **no size**: a length
+/// leaks entropy about the secret, which is the same reason `.env` emits key
+/// names only. The line still carries its exact range, so a caller that
+/// genuinely needs the value can `read` it.
+const REDACTED: &str = "<redacted>";
+
+/// Key-name fragments whose values are never rendered. The length threshold in
+/// the scalar hints is a token-budget heuristic, not a secret guard — an AWS
+/// secret key is exactly 40 characters and slipped through it whole — so
+/// JSON/YAML now follow the same "names, not values" rule `.env`, INI and TOML
+/// already do, keyed on the name.
+const SENSITIVE_KEY_TOKENS: &[&str] = &[
+    "password",
+    "passwd",
+    "pass",
+    "pwd",
+    "secret",
+    "secrets",
+    "token",
+    "apikey",
+    "credential",
+    "credentials",
+    "auth",
+    "authorization",
+    "key",
+    "keys",
+    "privatekey",
+    "signature",
+    "salt",
+    "session",
+    "cookie",
+    "dsn",
+    "connection",
+    "connectionstring",
+];
+
+/// Whether a value must not be rendered — judged by its key's name *or* by its
+/// own shape.
+///
+/// The shape check exists because a connection string carries its credentials
+/// no matter what it is called: `.NET` spells the key `connectionString`,
+/// `DATABASE_URL` spells it nothing like a secret, and both hold a password.
+/// Numbers and booleans are never redacted.
+fn must_redact(key: Option<&str>, raw: &str) -> bool {
+    if is_uninteresting_scalar(raw) {
+        return false;
+    }
+    key.is_some_and(is_sensitive_key) || value_looks_secret(raw)
+}
+
+/// A value that announces itself: an embedded `password=`-style pair, or a URI
+/// with credentials in its userinfo (`postgres://user:pw@host`).
+fn value_looks_secret(raw: &str) -> bool {
+    let low = raw.to_ascii_lowercase();
+    const EMBEDDED: [&str; 7] = [
+        "password=",
+        "passwd=",
+        "pwd=",
+        "secret=",
+        "token=",
+        "apikey=",
+        "api_key=",
+    ];
+    if EMBEDDED.iter().any(|p| low.contains(p)) {
+        return true;
+    }
+    let Some((_, rest)) = low.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // `user:pw@host` has credentials; a bare `host:port` does not.
+    match authority.split_once('@') {
+        Some((userinfo, _)) => userinfo.contains(':'),
+        None => false,
+    }
+}
+
+/// Whether `key` names something whose value must not be rendered.
+///
+/// The key is lowercased, stripped of quotes, and split on `_`, `-`, `.`, `/`,
+/// whitespace **and camelCase boundaries**, then matched token-wise — so
+/// `auth_token`, `apiKey` and `AWS_SECRET_ACCESS_KEY` all hit while `author`
+/// and `monkey` do not, which a substring match would get wrong.
+///
+/// Biased toward redacting. A false positive costs one uninformative line and
+/// the range is still there to `read`; a false negative puts a live credential
+/// in the transcript.
+fn is_sensitive_key(key: &str) -> bool {
+    let key = key.trim().trim_matches(|c| c == '"' || c == '\'');
+    // Split camelCase before lowercasing: apiKey -> api Key -> ["api","key"].
+    let mut spaced = String::with_capacity(key.len() + 8);
+    let mut prev_lower = false;
+    for ch in key.chars() {
+        if ch.is_uppercase() && prev_lower {
+            spaced.push('_');
+        }
+        prev_lower = ch.is_lowercase() || ch.is_numeric();
+        spaced.push(ch);
+    }
+    spaced
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| SENSITIVE_KEY_TOKENS.contains(&tok))
+}
+
+/// Values that carry no secret and are annoying to redact: booleans, null, and
+/// plain numbers. Without this, `auth_enabled: true` and `session_timeout: 30`
+/// would both render as `<redacted>` for no gain.
+fn is_uninteresting_scalar(raw: &str) -> bool {
+    let t = raw.trim().trim_matches(|c| c == '"' || c == '\'');
+    if t.is_empty() {
+        return true;
+    }
+    matches!(
+        t.to_ascii_lowercase().as_str(),
+        "true" | "false" | "null" | "nil" | "none" | "~" | "yes" | "no" | "on" | "off"
+    ) || t.parse::<f64>().is_ok()
 }
 
 /// Count named children of `node` whose kind is exactly `kind`.
@@ -1473,7 +2301,9 @@ fn yaml_walk(core: Node, src: &[u8], depth: usize, max_depth: usize, sink: &mut 
                     }
                     _ => {
                         let text = match value {
-                            Some(v) => format!("{key_text}: {}", yaml_scalar_hint(v, src)),
+                            Some(v) => {
+                                format!("{key_text}: {}", yaml_scalar_hint(Some(&key_text), v, src))
+                            }
                             None => format!("{key_text}:"),
                         };
                         sink.push(DeclLine {
@@ -1500,7 +2330,8 @@ fn yaml_walk(core: Node, src: &[u8], depth: usize, max_depth: usize, sink: &mut 
                 start_row: core.start_position().row,
                 end_row: tight_end_row(core),
                 indent: depth,
-                text: clip(yaml_scalar_hint(core, src)),
+                // A bare document-level scalar has no key to judge it by.
+                text: clip(yaml_scalar_hint(None, core, src)),
             });
         }
     }
@@ -1516,9 +2347,13 @@ fn count_mapping_pairs(mapping: Node) -> usize {
 }
 
 /// Short scalar shown verbatim; a long one is elided to its byte size so a giant
-/// block scalar (or an inlined secret) never enters the skeleton.
-fn yaml_scalar_hint(value: Node, src: &[u8]) -> String {
+/// block scalar never enters the skeleton. A value under a **sensitive key name**
+/// is redacted whatever its length — see [`is_sensitive_key`].
+fn yaml_scalar_hint(key: Option<&str>, value: Node, src: &[u8]) -> String {
     let raw = squash_ws(&text_of(value, src));
+    if must_redact(key, &raw) {
+        return REDACTED.to_string();
+    }
     if raw.chars().count() > 40 {
         format!(
             "<string, {}>",
@@ -1622,6 +2457,26 @@ fn text_of(node: Node, src: &[u8]) -> String {
     String::from_utf8_lossy(&src[node.start_byte()..node.end_byte()]).into_owned()
 }
 
+/// How much of a node we need in order to read a signature off it. Every
+/// consumer either takes the first line or stops at the first `{`, then clips
+/// to `MAX_SIG_CHARS` (200) — so a few KB is far more than enough.
+const MAX_SIG_SCAN: usize = 4096;
+
+/// The first [`MAX_SIG_SCAN`] bytes of a node.
+///
+/// [`text_of`] copies a node whole, which is wasteful for exactly the nodes we
+/// only want a header from: `signature_before_brace` on a `class`/`impl` used
+/// to allocate the entire body just to find its first `{`, and every
+/// `first_line(&text_of(…))` allocated a whole declaration to keep one line.
+/// Slicing may land mid-codepoint; `from_utf8_lossy` absorbs that, and the
+/// replacement character can only ever appear ~4 KB into a line that gets
+/// clipped at 200 characters anyway.
+fn node_head(node: Node, src: &[u8]) -> String {
+    let start = node.start_byte();
+    let end = node.end_byte().min(start + MAX_SIG_SCAN);
+    String::from_utf8_lossy(&src[start..end]).into_owned()
+}
+
 fn name_or(node: Node, src: &[u8], field: &str) -> String {
     node.child_by_field_name(field)
         .map(|n| text_of(n, src))
@@ -1632,12 +2487,16 @@ fn name_or(node: Node, src: &[u8], field: &str) -> String {
 /// whitespace-squashed. Falls back to the first line if there is no body.
 fn signature_before_body(node: Node, src: &[u8], body_field: &str) -> String {
     if let Some(body) = node.child_by_field_name(body_field) {
-        let s = &src[node.start_byte()..body.start_byte()];
+        // Normally short, but a generated declaration can carry a huge
+        // parameter list — cap it like every other signature read.
+        let start = node.start_byte();
+        let end = body.start_byte().min(start + MAX_SIG_SCAN);
+        let s = &src[start..end.max(start)];
         return squash_ws(&String::from_utf8_lossy(s))
             .trim_end()
             .to_string();
     }
-    first_line(&text_of(node, src))
+    first_line(&node_head(node, src))
         .trim_end_matches([';', '{'])
         .trim()
         .to_string()
@@ -1645,7 +2504,7 @@ fn signature_before_body(node: Node, src: &[u8], body_field: &str) -> String {
 
 /// Signature = the node's text up to the first `{`, whitespace-squashed.
 fn signature_before_brace(node: Node, src: &[u8]) -> String {
-    let full = text_of(node, src);
+    let full = node_head(node, src);
     let head = match full.find('{') {
         Some(i) => &full[..i],
         None => &full,
@@ -1693,6 +2552,229 @@ mod tests {
 
     fn rows(skeleton: &str) -> Vec<&str> {
         skeleton.lines().collect()
+    }
+
+    #[test]
+    fn xml_outlines_the_element_tree_and_redacts() {
+        let src = b"<project>\n  <artifactId>index</artifactId>\n  <properties>\n    <db.password>hunter2</db.password>\n    <compiler.source>21</compiler.source>\n  </properties>\n</project>\n";
+        let sk = outline_with_depth("pom.xml", "xml", src, 2).unwrap();
+        assert!(sk.contains("<project> (2 children)"), "{sk}");
+        // A leaf's text is the value — the element name alone says nothing.
+        assert!(sk.contains("<artifactId> index"), "{sk}");
+        assert!(sk.contains("<compiler.source> 21"), "{sk}");
+        // …unless the name looks sensitive. `settings.xml` and `web.config`
+        // are full of these.
+        assert!(sk.contains("<db.password> <redacted>"), "{sk}");
+        assert!(!sk.contains("hunter2"), "leaked:\n{sk}");
+    }
+
+    #[test]
+    fn xml_redacts_sensitive_attributes() {
+        let src = b"<add name=\"db\" connectionString=\"Server=x;Password=hunter2\" />\n";
+        let sk = outline("web.config", "xml", src).unwrap();
+        assert!(!sk.contains("hunter2"), "attribute value leaked:\n{sk}");
+        assert!(
+            sk.contains("name=\"db\""),
+            "ordinary attribute dropped:\n{sk}"
+        );
+    }
+
+    #[test]
+    fn html_lifts_references_and_looks_through_wrappers() {
+        let src = b"<!doctype html>\n<html lang=\"en\">\n<head>\n  <title>Demo</title>\n  <link rel=\"stylesheet\" href=\"/a.css\">\n  <script src=\"/a.js\"></script>\n</head>\n<body>\n  <main id=\"app\">\n    <h1>Hello</h1>\n  </main>\n</body>\n</html>\n";
+        let sk = outline("index.html", "html", src).unwrap();
+        assert!(sk.contains("imports: /a.css, /a.js"), "{sk}");
+        // html/head/body carry no structure; the landmarks must reach depth 0.
+        assert!(!sk.contains("<html"), "wrapper emitted:\n{sk}");
+        assert!(!sk.contains("<body"), "wrapper emitted:\n{sk}");
+        assert!(sk.contains("<main id=\"app\">"), "{sk}");
+        assert!(sk.contains("<title> Demo"), "leaf text missing:\n{sk}");
+    }
+
+    #[test]
+    fn html_void_element_range_stops_at_its_own_line() {
+        // `<link>` has no end tag and the grammar lets its node run on; an
+        // inflated range would point a follow-up `read` at the wrong lines.
+        let src = b"<html><head>\n<link rel=\"stylesheet\" href=\"/a.css\">\n<script src=\"/a.js\"></script>\n</head></html>\n";
+        let sk = outline("i.html", "html", src).unwrap();
+        let link = sk.lines().find(|l| l.contains("<link")).unwrap();
+        assert!(
+            link.contains("[2-2]"),
+            "void element range inflated: {link}"
+        );
+    }
+
+    #[test]
+    fn css_outlines_selectors_and_at_rules() {
+        let src = b"@import url(\"reset.css\");\n\n.btn, .btn-primary {\n  color: red;\n}\n\n@media (min-width: 40em) {\n  .nav { display: flex; }\n}\n";
+        let sk = outline("app.css", "css", src).unwrap();
+        assert!(sk.contains("imports: reset.css"), "{sk}");
+        assert!(sk.contains(".btn, .btn-primary"), "{sk}");
+        assert!(sk.contains("@media (min-width: 40em)"), "{sk}");
+        // Nested rules sit under their at-rule…
+        assert!(sk.contains(".nav"), "{sk}");
+        // …and property declarations are not structure.
+        assert!(!sk.contains("display"), "declaration emitted:\n{sk}");
+        assert!(!sk.contains("color"), "declaration emitted:\n{sk}");
+    }
+
+    #[test]
+    fn markup_extension_mapping() {
+        for ext in ["xml", "xsd", "csproj", "props", "targets", "plist", "wsdl"] {
+            assert_eq!(Lang::from_extension(ext), Some(Lang::Xml), "{ext}");
+        }
+        for ext in ["html", "htm", "xhtml"] {
+            assert_eq!(Lang::from_extension(ext), Some(Lang::Html), "{ext}");
+        }
+        assert_eq!(Lang::from_extension("css"), Some(Lang::Css));
+        // An SVG is path data; outlining it would be a wall of `<path>`.
+        assert_eq!(Lang::from_extension("svg"), None);
+    }
+
+    #[test]
+    fn shell_outlines_functions_sources_and_assignments() {
+        let src = b"#!/usr/bin/env bash\nsource ./lib/common.sh\n. ./lib/log.sh\nREGISTRY=\"ghcr.io/acme\"\nexport API_TOKEN=\"ghp_supersecret\"\n\nbuild() {\n  echo hi\n}\n\nfunction push {\n  echo bye\n}\n";
+        let sk = outline("deploy.sh", "sh", src).unwrap();
+        assert!(
+            sk.contains("./lib/common.sh"),
+            "source not an import:\n{sk}"
+        );
+        assert!(sk.contains("./lib/log.sh"), "`.` not an import:\n{sk}");
+        assert!(sk.contains("build()"), "{sk}");
+        assert!(
+            sk.contains("push()"),
+            "`function name {{}}` form missed:\n{sk}"
+        );
+        // Names only — a shell script is where `export API_KEY=…` actually lives.
+        assert!(sk.contains("API_TOKEN="), "{sk}");
+        assert!(!sk.contains("ghp_supersecret"), "value leaked:\n{sk}");
+        assert!(!sk.contains("ghcr.io/acme"), "value leaked:\n{sk}");
+    }
+
+    #[test]
+    fn shell_extensions_map_to_one_grammar() {
+        for ext in ["sh", "bash", "zsh", "ksh"] {
+            assert_eq!(Lang::from_extension(ext), Some(Lang::Shell), "{ext}");
+        }
+    }
+
+    #[test]
+    fn makefile_outlines_targets_and_variable_names() {
+        let src = b"CC := gcc\nPREFIX ?= /usr/local\n\n.PHONY: all clean\n\nall: build test\n\tfoo\n\nbuild:\n\t$(CC) -o app main.c\n";
+        let sk = outline("Makefile", "mk", src).unwrap();
+        assert!(sk.contains("all: build test"), "target missing:\n{sk}");
+        assert!(sk.contains("build:"), "{sk}");
+        // Assignments are variables, not targets, and show the name only.
+        assert!(sk.contains("CC ="), "{sk}");
+        assert!(!sk.contains("gcc"), "variable value leaked:\n{sk}");
+        assert!(sk.contains("PREFIX ="), "?= form missed:\n{sk}");
+        // A recipe body is never a declaration.
+        assert!(!sk.contains("-o app"), "recipe line emitted:\n{sk}");
+    }
+
+    #[test]
+    fn dockerfile_nests_instructions_under_their_stage() {
+        let src = b"# comment\nFROM rust:1.83 AS builder\nARG GITHUB_TOKEN=ghp_leaky\nRUN cargo build\n\nFROM debian:slim\nENV APP_ENV=production SECRET_KEY=hunter2\nENTRYPOINT [\"/usr/bin/app\"]\n";
+        let sk = outline("Dockerfile", "dockerfile", src).unwrap();
+        assert!(sk.contains("FROM rust:1.83 AS builder"), "{sk}");
+        assert!(
+            sk.contains("FROM debian:slim"),
+            "second stage missing:\n{sk}"
+        );
+        assert!(sk.contains("RUN cargo build"), "{sk}");
+        // ARG/ENV are classic token carriers: names only.
+        assert!(sk.contains("ARG GITHUB_TOKEN"), "{sk}");
+        assert!(!sk.contains("ghp_leaky"), "build arg leaked:\n{sk}");
+        assert!(sk.contains("ENV APP_ENV SECRET_KEY"), "{sk}");
+        assert!(!sk.contains("hunter2"), "env value leaked:\n{sk}");
+        // Stage instructions are indented under their FROM.
+        let from = sk.find("FROM rust").unwrap();
+        let run = sk.find("RUN cargo").unwrap();
+        assert!(from < run, "ordering wrong:\n{sk}");
+    }
+
+    #[test]
+    fn yaml_redacts_values_under_sensitive_keys() {
+        // The 40-char elision threshold is a token heuristic, not a secret
+        // guard — that AWS key is exactly 40 chars and used to print in full.
+        let src = b"database:\n  password: hunter2\n  aws_secret_access_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n  apiToken: ghp_16C7e42F292c6912E7710c838347Ae178B4a\n  host: db.internal\n  port: 5432\n";
+        let sk = outline_with_depth("s.yaml", "yaml", src, 2).unwrap();
+        assert!(!sk.contains("hunter2"), "password leaked:\n{sk}");
+        assert!(!sk.contains("wJalrXUtnFEMI"), "aws key leaked:\n{sk}");
+        assert!(!sk.contains("ghp_16C7"), "camelCase key missed:\n{sk}");
+        assert!(sk.contains("password: <redacted>"), "{sk}");
+        // Non-secrets stay legible, or the outline stops being useful.
+        assert!(sk.contains("host: db.internal"), "{sk}");
+        assert!(sk.contains("port: 5432"), "{sk}");
+    }
+
+    #[test]
+    fn json_redacts_values_under_sensitive_keys() {
+        let src = br#"{"stripe_key": "sk_live_51H8xY2eZvKYlo2C", "region": "us-east-1", "auth_enabled": true}"#;
+        let sk = outline_with_depth("c.json", "json", src, 2).unwrap();
+        assert!(!sk.contains("sk_live"), "secret leaked:\n{sk}");
+        assert!(sk.contains("<redacted>"), "{sk}");
+        assert!(sk.contains("us-east-1"), "non-secret elided:\n{sk}");
+        // Booleans carry nothing worth hiding and redacting them is just noise.
+        assert!(sk.contains("true"), "boolean redacted:\n{sk}");
+    }
+
+    #[test]
+    fn sensitive_key_matching_is_token_wise() {
+        for k in [
+            "password",
+            "PASSWORD",
+            "aws_secret_access_key",
+            "apiKey",
+            "api-token",
+            "x.auth.token",
+            "\"client_secret\"",
+        ] {
+            assert!(is_sensitive_key(k), "{k} should be sensitive");
+        }
+        // A substring match would wrongly catch every one of these.
+        for k in [
+            "author",
+            "monkey",
+            "passenger",
+            "keyboard",
+            "tokenizer",
+            "region",
+        ] {
+            assert!(!is_sensitive_key(k), "{k} should not be sensitive");
+        }
+    }
+
+    #[test]
+    fn a_value_can_betray_itself() {
+        // A connection string holds a password whatever the key is called —
+        // `.NET` says connectionString, Heroku says DATABASE_URL.
+        for v in [
+            "Server=x;Password=hunter2",
+            "postgres://user:hunter2@db:5432/app",
+            "https://x.com/cb?api_key=abc123",
+        ] {
+            assert!(must_redact(None, v), "{v} should redact on shape alone");
+        }
+        // …but an ordinary URL is not a secret, and redacting every one of
+        // them would gut the outline.
+        for v in [
+            "https://example.com/docs",
+            "postgres://db:5432/app",
+            "host:5432",
+        ] {
+            assert!(!must_redact(None, v), "{v} should not redact");
+        }
+    }
+
+    #[test]
+    fn redaction_shows_no_size() {
+        // A length leaks entropy about the secret — the same reason `.env`
+        // emits key names only.
+        let sk = outline_with_depth("s.yaml", "yaml", b"token: abcdefghijklmnop\n", 1).unwrap();
+        assert!(sk.contains("<redacted>"), "{sk}");
+        assert!(!sk.contains(" B>"), "size leaked:\n{sk}");
+        assert!(!sk.contains("16"), "length leaked:\n{sk}");
     }
 
     #[test]
@@ -2350,11 +3432,17 @@ end
 
     #[test]
     fn yaml_long_scalar_elided() {
+        // `description`, not `token`: this pins size-based elision, and a
+        // sensitive key name would short-circuit to <redacted> before the
+        // length ever mattered (see yaml_redacts_values_under_sensitive_keys).
         let big = "x".repeat(100);
-        let src = format!("token: {big}\nshort: ok\n");
+        let src = format!("description: {big}\nshort: ok\n");
         let sk = outline("c.yaml", "yaml", src.as_bytes()).unwrap();
         assert!(!sk.contains(&big), "long scalar leaked:\n{sk}");
-        assert!(sk.contains("token: <string,"), "elision missing:\n{sk}");
+        assert!(
+            sk.contains("description: <string,"),
+            "elision missing:\n{sk}"
+        );
         assert!(sk.contains("short: ok"), "{sk}");
     }
 

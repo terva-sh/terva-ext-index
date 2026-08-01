@@ -104,13 +104,28 @@ come from the walk's `stat`, so even a huge tree renders in a couple of KB.
 The walk skips hidden entries (`.git`, `.venv`, …), heavy/generated trees
 (`node_modules`, `target`, `vendor`, `dist`, `build`, `__pycache__`, …), and
 symlinks (so it can't loop or escape the workspace), and is deterministic (files
-are sorted). The skeleton tier keeps a safety backstop of at most 200 files /
-256 KB / 20k directory entries visited; the map and rollup tiers are complete
-and small by construction.
+are sorted). Only names that are *always* build output are skipped — `bin` is
+deliberately not among them, since Rust binary crates live in `src/bin/`. CI
+directories (`.github`, `.gitlab`, `.circleci`) are walked despite being hidden:
+`.github/workflows/*.yml` is supported YAML and often the only description of
+how a project builds and releases. The skeleton tier keeps a safety backstop of
+at most 200 files / 256 KB / 20k directory entries visited; the map tier reads
+at most 8 MB computing line counts (past that a file shows `?` lines, with a
+note saying how many and why — its size is still exact, since sizes come from
+the walk's `stat`), and the rollup tier reads nothing at all.
+
+If the walk does exhaust its 20k-entry budget, the header says so and renders
+its counts as `N+` — a partial index is never presented as a complete one:
+
+```
+. — 19999+ supported files in 1+ directories — walk stopped at 20000 entries,
+so this is a LOWER BOUND; index a subdirectory for a complete view
+```
 
 ## Supported languages
 
-Picked by file extension (or filename, for `.env`):
+Picked by file extension — or by filename, for the formats that have no usable
+one (`.env`, `Makefile`, `Dockerfile`):
 
 | Language   | Extensions                                  |
 |------------|---------------------------------------------|
@@ -124,6 +139,12 @@ Picked by file extension (or filename, for `.env`):
 | C          | `.c`, `.h`                                   |
 | C++        | `.cc`, `.cpp`, `.cxx`, `.hpp`, `.hh`, `.hxx` |
 | Ruby       | `.rb`                                        |
+| Shell      | `.sh`, `.bash`, `.zsh`, `.ksh`               |
+| Makefile   | `Makefile`, `GNUmakefile`, `.mk`             |
+| Dockerfile | `Dockerfile`, `Dockerfile.*`, `Containerfile`, `.dockerfile` |
+| XML        | `.xml`, `.xsd`, `.xsl`, `.xslt`, `.plist`, `.csproj`, `.props`, `.targets`, `.wsdl` |
+| HTML       | `.html`, `.htm`, `.xhtml`                    |
+| CSS        | `.css`                                       |
 | Markdown   | `.md`, `.markdown`                           |
 | JSON       | `.json`, `.jsonc`                            |
 | YAML       | `.yaml`, `.yml`                              |
@@ -132,6 +153,64 @@ Picked by file extension (or filename, for `.env`):
 | dotenv     | `.env`, `.env.*`, `*.env`                    |
 | CSV/TSV    | `.csv`, `.tsv`                               |
 | logs/text  | `.log`, `.txt`                               |
+
+Shell scripts (`.sh`, `.bash`, `.zsh`, `.ksh`, via tree-sitter-bash) outline to
+their **function definitions**, with `source foo.sh` / `. foo.sh` treated as the
+imports line. Top-level assignments are listed as **names only** — a shell
+script is where `export API_TOKEN=…` actually lives — which also means a linear
+script with no functions at all still outlines to something useful: its knobs.
+
+```
+deploy.sh
+  imports: ./lib/common.sh, ./lib/log.sh
+  [6-6]    REGISTRY=
+  [7-7]    API_TOKEN=
+  [10-12]  build()
+  [14-16]  push()
+```
+
+For a **Makefile** the skeleton is its **targets**, each spanning to the line
+before the next one so a follow-up `read` lands on that recipe — this is where
+an index earns the most, since a long Makefile is a flat list of dozens of
+targets that is otherwise a `grep`. Recipe bodies (tab-indented) are never
+emitted, and variables show names only. For a **Dockerfile** the `FROM` lines
+are the top level (a multi-stage build's stages) with each stage's instructions
+nested under it; `ENV` and `ARG` show names only, since a build arg is a classic
+place for a token.
+
+**XML** and **HTML** outline to their **element tree** — the same shape as the
+JSON/YAML key hierarchy, since a markup file's structure *is* its nesting. An
+element shows its tag, its attributes and either a short text value or a child
+count; text and attribute values follow the same elide-and-redact rules as
+JSON/YAML, because a `pom.xml`, `settings.xml` or `web.config` is a place
+credentials genuinely live.
+
+```
+pom.xml
+  [1-14]   <project xmlns="http://maven.apache.org/POM/4.0.0"> (5 children)
+    [2-2]    <artifactId> index
+    [5-8]    <properties> (2 children)
+      [6-6]    <db.password> <redacted>
+```
+
+HTML additionally lifts `<script src>` and `<link href>` into the imports line,
+and looks *through* `<html>`, `<head>` and `<body>` — they carry no structure of
+their own, and nesting everything under them would make `depth: 1` show nothing
+but two wrappers. So a page's landmarks land at the top level:
+
+```
+index.html
+  imports: /assets/app.css, /assets/app.js
+  [4-4]    <title> Demo
+  [9-11]   <header id="top" class="site-header"> (1 child)
+  [12-14]  <main id="app"> (1 child)
+```
+
+For **CSS** the skeleton is its **selector list** — one line per rule set with
+the range of the whole rule, so a follow-up `read` lands on that block, with
+`@media` / `@supports` / `@keyframes` nesting their rules underneath and
+`@import` going to the imports line. Property declarations are not emitted; the
+selectors are what you look a stylesheet up by.
 
 For Markdown the "skeleton" is the document's **headings** — a table of
 contents. Each heading's range spans its whole section (down to the next
@@ -151,6 +230,36 @@ skeleton. JSONC comments and trailing commas are tolerated.
 YAML (`.yaml`/`.yml`) uses the same key-hierarchy shape over block/flow
 mappings: a mapping value shows `{N keys}`, a sequence shows `[N items]`, and
 multiple `---` documents are split with a `--- document N` line.
+
+**Values under a secret-looking key name are redacted** — in JSON, YAML and XML
+alike — whatever their length:
+
+```
+database: {3 keys}
+  password: <redacted>
+  aws_secret_access_key: <redacted>
+  host: db.internal
+```
+
+The size-based elision above it is a token-budget heuristic, not a secret guard
+— an AWS secret key is exactly 40 characters and slipped straight through it —
+so the key *name* decides instead. Names are split on `_`, `-`, `.` and
+camelCase and matched token-wise against `password`, `secret`, `token`, `key`,
+`auth`, `credential`, … so `apiKey` and `AWS_SECRET_ACCESS_KEY` are caught while
+`author` and `monkey` are not. Booleans, `null` and plain numbers are never
+redacted (they hide nothing and `auth_enabled: <redacted>` helps no one), and a
+redaction carries **no size**, since a length leaks entropy about the secret.
+The line keeps its exact range, so a caller that genuinely needs the value can
+`read` it. Matching is deliberately eager: a false positive costs one
+uninformative line, a false negative puts a live credential in the transcript.
+
+A value can also betray itself regardless of its key, because a connection
+string carries its own credentials and nobody agrees on what to call it — .NET
+says `connectionString`, Heroku says `DATABASE_URL`. So a value holding an
+embedded `password=` / `secret=` / `token=` pair, or a URI with credentials in
+its userinfo (`postgres://user:pw@host`), is redacted on shape alone. An
+ordinary URL is not: `https://example.com/docs` and `postgres://db:5432/app`
+both pass through, since redacting every URL would gut the outline.
 
 For TOML the skeleton is its **sections + key names**: `[section]` and
 `[[array.of.tables]]` headers at the top level, each section's keys nested one
@@ -183,6 +292,20 @@ For any other file type — a file over ~2 MB, one that can't be read, or one
 **outside the workspace** (see [Sandbox](#sandbox)) — the tool returns an
 **error** result telling the model to fall back to `read` (it does not try to
 outline what it can't parse).
+
+A path that **does not exist** is the one case where `read` cannot help: it
+fails with the same `ENOENT` one call later. So `index` answers it instead —
+it names the deepest directory above the path that does exist and lists what is
+in it, capped at 50 entries with an `… and N more` tail:
+
+```
+index: no such path src/mainn.rs — `mainn.rs` is not in src/, which contains:
+main.rs  outline.rs  sandbox.rs
+```
+
+Missed paths are usually structurally right and filename-wrong, so the listing
+is normally the answer. It stays an `is_error` result — the request did not
+produce an outline, and the host's stall detector keys off that flag.
 
 Skeletons are also bounded: the imports list caps at 40 entries and the
 declaration list at 500, each with a `(+N more)` / `… (output truncated …)`
@@ -271,7 +394,10 @@ directory instead of the launch-time one.
 Speaks terva extension protocol **v2+** (declares `min_protocol: 2` — the
 lowest host that re-fires `session_start`, which the jail relies on to follow
 `/cd`; `index` otherwise uses only base read-only-tool features). On startup it
-emits `hello`, `register_tool` (read-only, `authority: local-read`),
+emits `hello`, `register_tool` (read-only, `authority: local-read`, and
+`essential` — so a host with lazy tool visibility keeps `index` advertised
+instead of deferring it behind an activation round-trip the standing guidance
+below would have already sent you past),
 `register_context` (the "prefer index before read" standing guidance),
 `subscribe` (for `session_start`), and `ready` — all eagerly before
 `hello_ack`, matching the Go SDK. It then reads frames and handles `hello_ack`

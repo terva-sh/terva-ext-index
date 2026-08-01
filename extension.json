@@ -1,6 +1,6 @@
 {
   "name": "index",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "exec": "./run.sh",
   "language": "rust",
   "description": "Emit a file's tree-sitter skeleton (imports + signatures with exact line ranges) so the model can understand structure before a full read.",

@@ -1,6 +1,6 @@
 [package]
 name = "terva-ext-index"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "terva index extension: emit a file's tree-sitter skeleton (imports + signatures with exact line ranges) instead of its body"
 license = "MIT"
@@ -34,6 +34,15 @@ tree-sitter-md = "0.5"
 tree-sitter-json = "0.24"
 tree-sitter-yaml = "0.7"
 tree-sitter-toml-ng = "0.7"
+# Shell. Nearly every repo has scripts and they were falling through to
+# "unsupported — use `read`". Same `tree-sitter-language` 0.1 ABI bridge, so the
+# tree still holds exactly one tree-sitter major. Used for sh/bash/zsh: the
+# grammar recovers on non-bash dialects, which costs declarations rather than
+# producing wrong ones.
+tree-sitter-bash = "0.25"
+tree-sitter-xml = "0.7.0"
+tree-sitter-html = "0.23.2"
+tree-sitter-css = "0.25.0"
 
 # serde_json is a normal dependency above, so it's already available to the
 # unit and integration tests — no dev-dependency duplicate needed.

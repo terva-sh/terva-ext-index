@@ -27,7 +27,7 @@ use sandbox::{Jail, JailError};
 
 /// Kept equal to Cargo.toml's `version` and extension.json's `version` by the
 /// `version_matches_manifests` test below; bump all three together on release.
-const VERSION: &str = "0.6.0";
+const VERSION: &str = "0.7.0";
 
 /// We use the protocol-2 `session_start` event to follow `cwd` across `/cd`
 /// (so the jail tracks the live working directory). That is the lowest host
@@ -39,7 +39,10 @@ const MIN_PROTOCOL: i64 = 2;
 const MAX_DEPTH: u64 = 8;
 
 const TOOL_DESC: &str = "Outline a file's structure with exact line ranges — code as imports + \
-     type/function/class signatures, JSON/YAML/TOML as their key hierarchy, INI/.env \
+     type/function/class signatures, shell scripts as functions + variable names, \
+     Makefiles as targets, Dockerfiles as build stages, XML/HTML as their element \
+     tree and CSS as its selectors, \
+     JSON/YAML/TOML as their key hierarchy, INI/.env \
      as key names with values omitted, CSV/logs summarized — or pass a \
      directory: a small package maps every file's skeleton, while a large tree \
      returns a file/directory map instead — `index` a specific file or \
@@ -55,8 +58,14 @@ const STANDING_CONTEXT: &str =
      ranges for ~70-90% fewer tokens than a full read. Use the line range it \
      gives you to follow up with `read` offset/limit on just the part you need. \
      Supported: Rust, Go, Python, JavaScript, TypeScript/TSX, Java, C, C++, Ruby \
-     (imports + signatures), Markdown (headings as a table of contents), \
-     JSON/YAML (key hierarchy with array/sequence lengths; long values elided), \
+     (imports + signatures), shell (sh/bash/zsh: functions + sourced files, with \
+     variable names only), Makefile (targets), Dockerfile (build stages and \
+     their instructions), XML (element tree with text/attributes; \
+     `.xml`/`.xsd`/`.csproj`/`.plist`/…), HTML (element tree, with script/link \
+     references as imports), CSS (selectors and at-rules), \
+     Markdown (headings as a table of contents), \
+     JSON/YAML (key hierarchy with array/sequence lengths; long values elided \
+     and values under secret-looking key names redacted), \
      TOML/INI (sections + key names), .env (key names only — values never \
      shown), CSV/TSV (header + column/row summary), and logs/text (line counts + \
      first/last line + severity scan). Pass a directory to map it: a small \
@@ -148,6 +157,15 @@ fn run() -> io::Result<()> {
             },
             "read_only": true,
             "authority": "local-read",
+            // Our standing guidance ("prefer `index` before `read`") is always
+            // in the model's context, so the tool it names has to be advertised
+            // from turn one. Under lazy tool visibility an extension's tools
+            // otherwise defer behind an `activate_tools` round-trip, and the
+            // first read usually lands before the model thinks to activate us —
+            // exactly the read the guidance exists to prevent. Additive: a host
+            // that predates the field ignores it, and one with lazy visibility
+            // off advertises everything anyway.
+            "essential": true,
         }),
     )?;
     send(
@@ -231,7 +249,22 @@ fn run() -> io::Result<()> {
                     .and_then(Value::as_u64)
                     .unwrap_or(1)
                     .min(MAX_DEPTH) as usize;
-                let (text, is_error) = handle_index(path_arg, depth, &dirs);
+                // One bad file must not take the tool out for the rest of the
+                // session. `handle_index` is read-only and owns no shared state,
+                // so catching an unwind here loses nothing — the default panic
+                // hook has already written the details to stderr, which terva
+                // captures to its extension log. (A grammar segfault is still
+                // fatal; that is not the failure this guards.)
+                let call = std::panic::AssertUnwindSafe(|| handle_index(path_arg, depth, &dirs));
+                let (text, is_error) = std::panic::catch_unwind(call).unwrap_or_else(|_| {
+                    (
+                        format!(
+                            "index: internal error while outlining {path_arg} (see the extension \
+                             log). The tool is still running; fall back to `read` for this file."
+                        ),
+                        true,
+                    )
+                });
                 send(
                     &mut out,
                     &json!({
@@ -276,17 +309,13 @@ fn handle_index(path_arg: &str, depth: usize, dirs: &HostDirs) -> (String, bool)
     // Confine to the workspace. This both canonicalizes (resolving symlinks,
     // which defeats a symlink that escapes the workspace) and confirms the
     // result is inside a jail root.
-    let canon = match dirs.jail().resolve(&resolved) {
+    let jail = dirs.jail();
+    let canon = match jail.resolve(&resolved) {
         Ok(p) => p,
-        Err(JailError::NotFound(e)) => {
-            return (
-                format!(
-                    "index: cannot access {} ({e}). Fall back to `read` (it may not exist or be unreadable).",
-                    resolved.display()
-                ),
-                true,
-            )
-        }
+        // A path that does not exist is answered, not just refused: see
+        // `path_miss_message`. Notably it does *not* suggest `read` — `read`
+        // hits the same ENOENT one call later.
+        Err(JailError::NotFound(e)) => return (path_miss_message(&resolved, &e, &jail, dirs), true),
         Err(JailError::Outside) => {
             return (
                 format!(
@@ -299,6 +328,10 @@ fn handle_index(path_arg: &str, depth: usize, dirs: &HostDirs) -> (String, bool)
         }
     };
 
+    // "Fall back to `read`" is right *here* and wrong for a path miss: the
+    // canonicalize above already succeeded, so this is a race or a permission
+    // problem, not a missing file, and `read` is a reasonable second opinion.
+    // Same for the read error below.
     let meta = match std::fs::metadata(&canon) {
         Ok(m) => m,
         Err(e) => {
@@ -360,6 +393,146 @@ fn handle_index(path_arg: &str, depth: usize, dirs: &HostDirs) -> (String, bool)
     }
 }
 
+// --- Path misses -----------------------------------------------------------
+
+/// How many entries a path-miss listing names before it truncates. Deliberately
+/// far below `MAP_DIR_FILES` (300): this listing rides inside an error message,
+/// and one that renders 300 filenames has re-created the very firehose
+/// directory mode exists to avoid.
+const MISS_LIST_ENTRIES: usize = 50;
+
+/// Answer a path that does not exist by naming what *does*.
+///
+/// The old message said "fall back to `read`", which cannot work — `read` hits
+/// the identical ENOENT one call later. What the caller needs is the contents
+/// of the directory it was aiming at: a missed path is usually structurally
+/// right and filename-wrong (`save.go` asked for, only `save_test.go` present),
+/// and without the listing the misses chain inside one directory. See
+/// `docs/proposals/path-miss-guidance.md`.
+fn path_miss_message(resolved: &Path, err: &io::Error, jail: &Jail, dirs: &HostDirs) -> String {
+    let asked = workspace_display(resolved, dirs);
+
+    let Some((dir, missing)) = nearest_existing_ancestor(resolved, jail) else {
+        return format!(
+            "index: cannot access {asked} ({err}). No directory above it exists inside \
+             the workspace; use `glob` to locate the file."
+        );
+    };
+    // `.` is the workspace root itself, where "in ./" reads badly.
+    let here = match workspace_display(&dir, dirs) {
+        d if d == "." => "the workspace root".to_string(),
+        d => format!("{d}/"),
+    };
+
+    let Some((names, total)) = list_dir_entries(&dir) else {
+        return format!(
+            "index: no such path {asked} — `{missing}` is not in {here}, which could not \
+             be listed. Use `glob` to locate the file."
+        );
+    };
+    if total == 0 {
+        return format!("index: no such path {asked} — {here} is empty.");
+    }
+    let mut msg = format!(
+        "index: no such path {asked} — `{missing}` is not in {here}, which contains: {}",
+        render_entries(&names, total)
+    );
+    if total > names.len() {
+        msg.push_str(" Use `glob` if the file you want is not listed.");
+    }
+    msg
+}
+
+/// Walk up from a missing path to the deepest ancestor that exists inside the
+/// jail, returning it with the component under it that does not — i.e. the
+/// first thing the caller got wrong.
+///
+/// `Jail::resolve` is a single `canonicalize`, which reports only *that*
+/// something in the path is missing, never *which* component, so the walk has
+/// to be redone here. It costs one `canonicalize` per component on the error
+/// path only, and it self-terminates: above the jail root `resolve` returns
+/// `Outside`, so the climb stops at the workspace instead of marching to `/`.
+fn nearest_existing_ancestor(resolved: &Path, jail: &Jail) -> Option<(PathBuf, String)> {
+    let mut missing = resolved.file_name()?.to_string_lossy().into_owned();
+    let mut cur = resolved.parent()?;
+    loop {
+        match jail.resolve(cur) {
+            Ok(canon) if canon.is_dir() => return Some((canon, missing)),
+            // An ancestor exists but is a file (ENOTDIR) — nothing to list.
+            Ok(_) => return None,
+            Err(JailError::Outside) => return None,
+            Err(JailError::NotFound(_)) => {
+                missing = cur.file_name()?.to_string_lossy().into_owned();
+                cur = cur.parent()?;
+            }
+        }
+    }
+}
+
+/// One level of `dir`, stat-only, capped at `MISS_LIST_ENTRIES`; returns the
+/// names alongside the true total so the caller can render a truncation tail.
+/// Directories carry a trailing `/`.
+///
+/// Unlike the directory walk this lists hidden entries and denied dirs rather
+/// than filtering them: it never descends, so `node_modules/` costs one line —
+/// and a listing that omits `.env` while the caller is hunting `.env` is worse
+/// than a long one.
+fn list_dir_entries(dir: &Path) -> Option<(Vec<String>, usize)> {
+    let rd = std::fs::read_dir(dir).ok()?;
+    // Keep a bounded window and count the rest, rather than materializing every
+    // name in a directory that might hold a million of them. The window holds
+    // one extra so a sort can still surface the alphabetically-smallest set.
+    const WINDOW: usize = MISS_LIST_ENTRIES * 4;
+    let mut names: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    for e in rd.flatten() {
+        total += 1;
+        if names.len() < WINDOW {
+            let mut name = e.file_name().to_string_lossy().into_owned();
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                name.push('/');
+            }
+            names.push(name);
+        }
+    }
+    names.sort();
+    names.truncate(MISS_LIST_ENTRIES);
+    Some((names, total))
+}
+
+/// Render a capped listing on one line, with an `… and N more` tail when the
+/// directory held more than we show.
+fn render_entries(names: &[String], total: usize) -> String {
+    let mut s = names.join("  ");
+    if total > names.len() {
+        s.push_str(&format!(
+            "  … and {} more ({total} total).",
+            total - names.len()
+        ));
+    }
+    s
+}
+
+/// Path as the caller thinks of it: relative to the workspace when it is inside
+/// one, else absolute. Tries the raw `cwd` and its canonical form, since a
+/// resolved-but-missing path has been through neither.
+fn workspace_display(path: &Path, dirs: &HostDirs) -> String {
+    if let Some(cwd) = dirs.cwd.as_deref() {
+        let roots = [Some(cwd.to_path_buf()), std::fs::canonicalize(cwd).ok()];
+        for root in roots.into_iter().flatten() {
+            if let Ok(rel) = path.strip_prefix(&root) {
+                let rel = rel.to_string_lossy();
+                return if rel.is_empty() {
+                    ".".to_string()
+                } else {
+                    rel.into_owned()
+                };
+            }
+        }
+    }
+    path.display().to_string()
+}
+
 // --- Directory mode --------------------------------------------------------
 
 /// A directory request maps a whole subtree, so it needs its own bounds on top
@@ -379,8 +552,25 @@ const MAX_WALK_ENTRIES: usize = 20_000; // directory entries visited during the 
 const SKELETON_DIR_FILES: usize = 30;
 const MAP_DIR_FILES: usize = 300;
 
+/// Hidden directories the walk descends into anyway.
+///
+/// The walk skips dotfiles wholesale, which quietly excluded CI configuration —
+/// `.github/workflows/*.yml` is YAML we fully support and is often the only
+/// description of how a project builds, tests and releases. These are small,
+/// hand-written, and exactly the kind of thing someone indexing a repo wants.
+/// The `.env` family is allowlisted the same way at the file level.
+const ALLOW_HIDDEN_DIRS: &[&str] = &[".github", ".gitlab", ".circleci"];
+
 /// Directory names we never descend into (heavy / generated trees). Hidden
-/// entries (dotfiles/dirs like .git, .venv) are skipped separately.
+/// entries (dotfiles/dirs like .git, .venv) are skipped separately, except for
+/// `ALLOW_HIDDEN_DIRS`.
+///
+/// Every name here must be *only* ever build output. `bin` used to be on this
+/// list and was wrong: Rust binary crates live in `src/bin/`, and a `bin/`
+/// directory of scripts is ordinary source — denying it made real files
+/// invisible with no way for the caller to tell. A directory of compiled
+/// binaries costs nothing to walk anyway, since only supported source
+/// extensions are collected.
 const DENY_DIRS: &[&str] = &[
     "node_modules",
     "target",
@@ -389,7 +579,6 @@ const DENY_DIRS: &[&str] = &[
     "build",
     "__pycache__",
     "venv",
-    "bin",
     "obj",
 ];
 
@@ -401,6 +590,102 @@ struct WalkFile {
     size: u64,
 }
 
+/// The result of walking a subtree: the supported files found, and whether the
+/// entry budget ran out before the walk finished.
+///
+/// `truncated` exists because the budget used to be a bare `&mut usize` that the
+/// walk silently returned on — a 20,500-file tree reported "19999 supported
+/// files" as though that were the exact count. Every renderer now marks a
+/// truncated walk as a lower bound.
+struct Walk {
+    files: Vec<WalkFile>,
+    budget: usize,
+    truncated: bool,
+}
+
+impl Walk {
+    fn new(budget: usize) -> Walk {
+        Walk {
+            files: Vec::new(),
+            budget,
+            truncated: false,
+        }
+    }
+
+    /// Recursively collect supported source files under `root`, newest bounds
+    /// applied. Skips hidden entries, denied dirs, and symlinks (so the walk
+    /// cannot loop or escape the workspace).
+    fn collect(&mut self, root: &Path) {
+        let rd = match std::fs::read_dir(root) {
+            Ok(rd) => rd,
+            Err(_) => return,
+        };
+        // Stream the directory rather than collecting it whole: a directory
+        // with a million entries would otherwise materialize a million
+        // `DirEntry`s before the budget below ever got a look in. We still sort
+        // what we keep, so output stays deterministic.
+        let mut entries: Vec<std::fs::DirEntry> = Vec::new();
+        for entry in rd.flatten() {
+            if entries.len() >= self.budget {
+                self.truncated = true;
+                break;
+            }
+            entries.push(entry);
+        }
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            if self.budget == 0 {
+                self.truncated = true;
+                return;
+            }
+            self.budget -= 1;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // Skip hidden entries, but allowlist the common dotfile configs
+            // (`.env` family) and CI directories so a walk still surfaces them.
+            if name.starts_with('.')
+                && !is_env_basename(&name)
+                && !ALLOW_HIDDEN_DIRS.contains(&name.as_ref())
+            {
+                continue; // hidden (.git, .venv, other dotfiles)
+            }
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ft.is_symlink() {
+                continue; // don't follow: avoids loops and jail escapes
+            }
+            if ft.is_dir() {
+                if !DENY_DIRS.contains(&name.as_ref()) {
+                    self.collect(&entry.path());
+                }
+            } else if ft.is_file() {
+                let path = entry.path();
+                if is_supported(&path) {
+                    // One extra stat per supported file, reused by every render
+                    // path — the rollup relies on it to avoid reading bodies.
+                    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    self.files.push(WalkFile { path, size });
+                }
+            }
+        }
+    }
+}
+
+/// The clause appended to a directory header when the walk hit its entry
+/// budget, so a truncated count is never read as an exact one.
+fn walk_note(truncated: bool) -> String {
+    if truncated {
+        format!(
+            " — walk stopped at {MAX_WALK_ENTRIES} entries, so this is a LOWER BOUND; \
+             index a subdirectory for a complete view"
+        )
+    } else {
+        String::new()
+    }
+}
+
 /// Map a directory subtree with progressive disclosure. A package-sized
 /// directory (`<= SKELETON_DIR_FILES`) gets full skeletons, exactly as before; a
 /// larger tree gets a *map* (one line per file); a very large tree gets a
@@ -409,15 +694,28 @@ struct WalkFile {
 /// expand skeletons only where you look — the file-level structure-before-body
 /// loop, applied one level up.
 fn handle_directory(dir: &Path, display: &str, depth: usize) -> (String, bool) {
-    let mut files = Vec::new();
-    let mut budget = MAX_WALK_ENTRIES;
-    collect_source_files(dir, &mut files, &mut budget);
+    let mut walk = Walk::new(MAX_WALK_ENTRIES);
+    walk.collect(dir);
+    let mut files = walk.files;
     files.sort_by(|a, b| a.path.cmp(&b.path));
+    let cut = walk.truncated;
 
     if files.is_empty() {
+        // Same shape as a path miss: we know what is in there, so say so rather
+        // than sending the caller off to `grep` blind. The listing also explains
+        // the result — a directory that is "empty" to `index` because everything
+        // in it sits under `node_modules/`, or is a format we don't outline.
+        let contents = match list_dir_entries(dir) {
+            Some((names, total)) if total > 0 => {
+                format!(" It contains: {}", render_entries(&names, total))
+            }
+            Some(_) => " The directory is empty.".to_string(),
+            None => String::new(),
+        };
         return (
             format!(
-                "index: {display} contains no supported source files to outline. Use `grep`/`read` to explore it."
+                "index: {display} contains no supported source files to outline.{contents} \
+                 Use `grep`/`read` to explore it."
             ),
             true,
         );
@@ -427,11 +725,11 @@ fn handle_directory(dir: &Path, display: &str, depth: usize) -> (String, bool) {
     // body to deepen, and letting `depth` through would re-inflate exactly the
     // tier meant to be cheap. `depth` keeps its meaning only on the skeleton path.
     if files.len() <= SKELETON_DIR_FILES {
-        (render_skeletons(dir, display, depth, &files), false)
+        (render_skeletons(dir, display, depth, &files, cut), false)
     } else if files.len() <= MAP_DIR_FILES {
-        (render_file_map(dir, display, &files), false)
+        (render_file_map(dir, display, &files, cut), false)
     } else {
-        (render_dir_rollup(dir, display, &files), false)
+        (render_dir_rollup(dir, display, &files, cut), false)
     }
 }
 
@@ -440,7 +738,13 @@ fn handle_directory(dir: &Path, display: &str, depth: usize) -> (String, bool) {
 /// as a safety backstop: with `files.len() <= SKELETON_DIR_FILES` the file-count
 /// cap never bites, but the byte cap still guards a package of unusually large
 /// files. Output is byte-for-byte what directory mode emitted before map-first.
-fn render_skeletons(dir: &Path, display: &str, depth: usize, files: &[WalkFile]) -> String {
+fn render_skeletons(
+    dir: &Path,
+    display: &str,
+    depth: usize,
+    files: &[WalkFile],
+    truncated: bool,
+) -> String {
     let total = files.len();
     let mut body = String::new();
     let mut shown = 0usize;
@@ -472,38 +776,66 @@ fn render_skeletons(dir: &Path, display: &str, depth: usize, files: &[WalkFile])
         }
     }
 
+    let note = walk_note(truncated);
     let mut out = if shown < total {
-        format!("{display} — {total} supported files (showing {shown}; index a specific file or subdirectory for the rest)\n\n")
+        format!("{display} — {total} supported files (showing {shown}; index a specific file or subdirectory for the rest){note}\n\n")
     } else {
-        format!("{display} — {total} supported files\n\n")
+        format!("{display} — {total} supported files{note}\n\n")
     };
     out.push_str(&body);
     out
 }
 
+/// Total bytes the map will read to compute line counts. A line count needs the
+/// whole file, and the map tier runs to `MAP_DIR_FILES` (300) files of up to
+/// `MAX_FILE_BYTES` (2 MB) each — so an unbudgeted map could do 600 MB of I/O to
+/// render a "cheap" listing. The rollup tier was made stat-only for exactly this
+/// reason; this puts a ceiling on the tier that still reads. Past the budget the
+/// count shows `?`, which the format already renders for an unreadable file.
+const MAP_LINE_COUNT_BYTES: usize = 8 * 1024 * 1024;
+
 /// A complete map of every supported file under `dir`: one line each with a
 /// `(lines, size)` hint, no skeleton body. The header tells the model how to
-/// expand it. Reads each file once for the line count (bounded by
-/// `MAP_DIR_FILES`); the byte size comes from the size stat'd during the walk.
-/// Every file is listed — nothing is silently dropped.
-fn render_file_map(dir: &Path, display: &str, files: &[WalkFile]) -> String {
+/// expand it. Line counts are read per file within `MAP_LINE_COUNT_BYTES`; the
+/// byte size always comes from the size stat'd during the walk, so every file
+/// keeps a size hint even past the budget. Every file the walk found is listed —
+/// and if the walk itself was cut short, the header says so rather than passing
+/// a partial count off as complete.
+fn render_file_map(dir: &Path, display: &str, files: &[WalkFile], truncated: bool) -> String {
     let mut out = format!(
         "{}\n(map only — `index <file>` or `index <subdir>` for skeletons)\n\n",
-        scale_header(dir, display, files),
+        scale_header(dir, display, files, truncated),
     );
+    let mut io_budget = MAP_LINE_COUNT_BYTES;
+    let mut unread = 0usize;
     for f in files {
         let rel = f.path.strip_prefix(dir).unwrap_or(&f.path);
-        // The line count needs the file's bytes; an unreadable or
-        // >MAX_FILE_BYTES file has none, so show `?` rather than `0` — a bare
+        // The line count needs the file's bytes; an unreadable, oversized or
+        // over-budget file has none, so show `?` rather than `0` — a bare
         // `0 lines` next to a multi-MB size reads like an empty file.
-        let lines = match read_bounded(&f.path, outline::MAX_FILE_BYTES) {
-            Ok(Some(b)) => line_count(&b).to_string(),
-            _ => "?".to_string(),
+        let lines = if f.size as usize > io_budget {
+            unread += 1;
+            "?".to_string()
+        } else {
+            match read_bounded(&f.path, outline::MAX_FILE_BYTES) {
+                Ok(Some(b)) => {
+                    io_budget = io_budget.saturating_sub(b.len());
+                    line_count(&b).to_string()
+                }
+                _ => "?".to_string(),
+            }
         };
         out.push_str(&format!(
             "{} ({lines} lines, {})\n",
             rel.to_string_lossy(),
             outline::human_bytes(f.size as usize),
+        ));
+    }
+    // Say which cap produced the `?`s rather than leaving them unexplained.
+    if unread > 0 {
+        out.push_str(&format!(
+            "\n({unread} line counts skipped past a {} read budget — sizes above are exact)\n",
+            outline::human_bytes(MAP_LINE_COUNT_BYTES)
         ));
     }
     out
@@ -513,7 +845,7 @@ fn render_file_map(dir: &Path, display: &str, files: &[WalkFile]) -> String {
 /// file sitting directly in `dir`), summing supported-file counts and the bytes
 /// stat'd during the walk. Reads nothing — even a monorepo root renders in a
 /// couple of KB — and `index <child>` descends into any group.
-fn render_dir_rollup(dir: &Path, display: &str, files: &[WalkFile]) -> String {
+fn render_dir_rollup(dir: &Path, display: &str, files: &[WalkFile], truncated: bool) -> String {
     let mut groups: HashMap<String, (usize, u64)> = HashMap::new();
     for f in files {
         let rel = f.path.strip_prefix(dir).unwrap_or(&f.path);
@@ -539,7 +871,7 @@ fn render_dir_rollup(dir: &Path, display: &str, files: &[WalkFile]) -> String {
 
     let mut out = format!(
         "{}\n(rolled up — `index <subdir>` to descend)\n\n",
-        scale_header(dir, display, files),
+        scale_header(dir, display, files, truncated),
     );
     for label in order {
         let (count, bytes) = groups[label];
@@ -555,67 +887,28 @@ fn render_dir_rollup(dir: &Path, display: &str, files: &[WalkFile]) -> String {
 /// The header line shared by the map and rollup tiers: `<display> — N supported
 /// files in M directories`, where M is the number of distinct directories (root
 /// counts as one) that hold a supported file — a cheap scale hint.
-fn scale_header(dir: &Path, display: &str, files: &[WalkFile]) -> String {
+/// A truncated walk renders its count as `N+`, so the number itself carries the
+/// caveat even if the trailing note is skimmed past.
+fn scale_header(dir: &Path, display: &str, files: &[WalkFile], truncated: bool) -> String {
     let mut seen: HashSet<PathBuf> = HashSet::new();
     for f in files {
         let rel = f.path.strip_prefix(dir).unwrap_or(&f.path);
         seen.insert(rel.parent().unwrap_or(Path::new("")).to_path_buf());
     }
     let dirs = seen.len();
-    let dir_word = if dirs == 1 {
+    // `1+` means "at least one", so it takes the plural — "1+ directory" reads
+    // like a typo.
+    let dir_word = if dirs == 1 && !truncated {
         "directory"
     } else {
         "directories"
     };
+    let plus = if truncated { "+" } else { "" };
     format!(
-        "{display} — {} supported files in {dirs} {dir_word}",
-        files.len()
+        "{display} — {}{plus} supported files in {dirs}{plus} {dir_word}{}",
+        files.len(),
+        walk_note(truncated)
     )
-}
-
-/// Recursively collect supported source files under `root`, sorted within each
-/// directory. Skips hidden entries, denied dirs, and symlinks (so the walk
-/// cannot loop or escape the workspace). `budget` bounds total entries visited.
-fn collect_source_files(root: &Path, out: &mut Vec<WalkFile>, budget: &mut usize) {
-    let rd = match std::fs::read_dir(root) {
-        Ok(rd) => rd,
-        Err(_) => return,
-    };
-    let mut entries: Vec<_> = rd.flatten().collect();
-    entries.sort_by_key(|e| e.file_name());
-    for entry in entries {
-        if *budget == 0 {
-            return;
-        }
-        *budget -= 1;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        // Skip hidden entries, but allowlist the common dotfile configs (`.env`
-        // family) so a directory walk still surfaces them.
-        if name.starts_with('.') && !is_env_basename(&name) {
-            continue; // hidden (.git, .venv, other dotfiles)
-        }
-        let ft = match entry.file_type() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        if ft.is_symlink() {
-            continue; // don't follow: avoids loops and jail escapes
-        }
-        if ft.is_dir() {
-            if !DENY_DIRS.contains(&name.as_ref()) {
-                collect_source_files(&entry.path(), out, budget);
-            }
-        } else if ft.is_file() {
-            let path = entry.path();
-            if is_supported(&path) {
-                // One extra stat per supported file, reused by every render
-                // path — the rollup relies on it to avoid reading file bodies.
-                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                out.push(WalkFile { path, size });
-            }
-        }
-    }
 }
 
 /// Read up to `max` bytes; `Ok(None)` means the file exceeded the cap.
@@ -642,12 +935,18 @@ fn line_count(bytes: &[u8]) -> usize {
     }
 }
 
-/// The extension `index` dispatches on. Normally the file extension, but the
-/// `.env` family has no usable one (`.env` has none; `.env.local`'s is `local`),
-/// so those filenames map to `env` — the one place that filename rule lives.
+/// The extension `index` dispatches on. Normally the file extension — but a
+/// few formats are identified by FILENAME instead, because their extension is
+/// unusable (`.env` has none, `.env.local`'s is `local`) or absent entirely
+/// (`Makefile`, `Dockerfile`). Those map to a pseudo-extension the outliner
+/// recognizes, and this is the one place that filename rule lives.
 fn dispatch_ext(path: &Path) -> String {
-    if is_env_name(path) {
-        return "env".to_string();
+    if let Some(pseudo) = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(basename_ext)
+    {
+        return pseudo.to_string();
     }
     path.extension()
         .and_then(|e| e.to_str())
@@ -655,17 +954,31 @@ fn dispatch_ext(path: &Path) -> String {
         .to_string()
 }
 
+/// The pseudo-extension for a filename-identified format, if `name` is one.
+fn basename_ext(name: &str) -> Option<&'static str> {
+    if is_env_basename(name) {
+        return Some("env");
+    }
+    // Case-insensitive: `makefile` and `Makefile` are both common, and
+    // `Dockerfile.prod` / `Containerfile` are the usual variants.
+    let lower = name.to_ascii_lowercase();
+    if lower == "makefile" || lower == "gnumakefile" {
+        return Some("mk");
+    }
+    if lower == "dockerfile"
+        || lower == "containerfile"
+        || lower.starts_with("dockerfile.")
+        || lower.starts_with("containerfile.")
+    {
+        return Some("dockerfile");
+    }
+    None
+}
+
 /// True for the dotenv family (`.env`, `.env.local`, `.env.production`, …),
 /// matched by filename because the extension is unreliable.
 fn is_env_basename(name: &str) -> bool {
     name == ".env" || name.starts_with(".env.")
-}
-
-fn is_env_name(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .map(is_env_basename)
-        .unwrap_or(false)
 }
 
 /// Whether the directory walk should outline this file.
@@ -737,7 +1050,101 @@ mod tests {
     fn missing_file_is_error() {
         let (text, is_err) = handle_index("/nope/does-not-exist.rs", 1, &dirs_for(None));
         assert!(is_err);
-        assert!(text.contains("Fall back to `read`"), "{text}");
+        // Nothing above it is inside the jail, so there is no listing to give —
+        // but it must still not send the caller to `read`, which fails the same.
+        assert!(text.contains("use `glob`"), "{text}");
+        assert!(!text.contains("`read`"), "read cannot help here:\n{text}");
+    }
+
+    #[test]
+    fn path_miss_names_the_siblings() {
+        let dir = tempdir("miss-siblings");
+        std::fs::create_dir_all(dir.join("store/save")).unwrap();
+        std::fs::write(dir.join("store/save/save_test.go"), b"package save\n").unwrap();
+        std::fs::write(dir.join("store/save/replay.go"), b"package save\n").unwrap();
+        let (text, is_err) = handle_index("store/save/save.go", 1, &dirs_for(Some(dir.clone())));
+        assert!(is_err, "{text}");
+        assert!(text.contains("`save.go` is not in store/save/"), "{text}");
+        assert!(text.contains("save_test.go"), "sibling missing:\n{text}");
+        assert!(text.contains("replay.go"), "sibling missing:\n{text}");
+        assert!(!text.contains("Fall back to `read`"), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn path_miss_climbs_to_the_deepest_existing_parent() {
+        let dir = tempdir("miss-climb");
+        std::fs::create_dir_all(dir.join("internal")).unwrap();
+        std::fs::write(dir.join("internal/real.rs"), b"pub fn r() {}\n").unwrap();
+        // Two components missing: `nope/` and the file under it.
+        let (text, is_err) = handle_index("internal/nope/x.rs", 1, &dirs_for(Some(dir.clone())));
+        assert!(is_err, "{text}");
+        assert!(
+            text.contains("`nope` is not in internal/"),
+            "should name the missing component, not the leaf:\n{text}"
+        );
+        assert!(text.contains("real.rs"), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn path_miss_at_the_workspace_root_reads_naturally() {
+        let dir = tempdir("miss-root");
+        std::fs::write(dir.join("main.rs"), b"pub fn m() {}\n").unwrap();
+        let (text, is_err) = handle_index("gone.rs", 1, &dirs_for(Some(dir.clone())));
+        assert!(is_err, "{text}");
+        assert!(text.contains("not in the workspace root"), "{text}");
+        assert!(text.contains("main.rs"), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn path_miss_listing_is_capped() {
+        let dir = tempdir("miss-cap");
+        let n = MISS_LIST_ENTRIES + 12;
+        for i in 0..n {
+            std::fs::write(dir.join(format!("f{i:03}.rs")), b"pub fn a() {}\n").unwrap();
+        }
+        let (text, is_err) = handle_index("gone.rs", 1, &dirs_for(Some(dir.clone())));
+        assert!(is_err, "{text}");
+        assert!(
+            text.contains(&format!("… and 12 more ({n} total)")),
+            "{text}"
+        );
+        assert!(text.contains("Use `glob`"), "{text}");
+        // The whole point of the cap: this stays a message, not a firehose.
+        assert!(
+            text.len() < 2_000,
+            "listing too large ({} bytes)",
+            text.len()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn path_miss_lists_hidden_entries() {
+        let dir = tempdir("miss-hidden");
+        std::fs::write(dir.join(".env.local"), b"K=v\n").unwrap();
+        let (text, _) = handle_index(".env", 1, &dirs_for(Some(dir.clone())));
+        assert!(
+            text.contains(".env.local"),
+            "a listing that hides the answer is worse than a long one:\n{text}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn path_miss_outside_the_workspace_lists_nothing() {
+        // The climb must stop at the jail root rather than listing a parent of
+        // the workspace. `/etc/nope.rs` has an existing parent — outside the jail.
+        let dir = tempdir("miss-outside");
+        let (text, is_err) = handle_index("/etc/nope.rs", 1, &dirs_for(Some(dir.clone())));
+        assert!(is_err, "{text}");
+        assert!(
+            !text.contains("which contains"),
+            "leaked a listing outside the workspace:\n{text}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -831,6 +1238,83 @@ mod tests {
     }
 
     #[test]
+    fn walks_ci_config_but_not_other_hidden_dirs() {
+        let dir = tempdir("cidir");
+        std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        std::fs::create_dir_all(dir.join(".venv/lib")).unwrap();
+        std::fs::write(
+            dir.join(".github/workflows/ci.yml"),
+            b"on: push\njobs: {}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join(".venv/lib/junk.py"), b"def junk():\n    pass\n").unwrap();
+        std::fs::write(dir.join("a.rs"), b"pub fn a() {}\n").unwrap();
+        let (text, is_err) = handle_index(".", 1, &dirs_for(Some(dir.clone())));
+        assert!(!is_err, "{text}");
+        assert!(
+            text.contains(".github/workflows/ci.yml"),
+            "CI config still hidden:\n{text}"
+        );
+        assert!(!text.contains("junk"), ".venv leaked:\n{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn walks_bin_directories() {
+        // `bin` was in DENY_DIRS, which made Rust binary crates (`src/bin/`)
+        // and `bin/` script dirs invisible with no hint they had been skipped.
+        let dir = tempdir("bindir");
+        std::fs::create_dir_all(dir.join("src/bin")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), b"pub fn lib() {}\n").unwrap();
+        std::fs::write(dir.join("src/bin/tool.rs"), b"pub fn tool() {}\n").unwrap();
+        let (text, is_err) = handle_index(".", 1, &dirs_for(Some(dir.clone())));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("src/bin/tool.rs"), "bin/ skipped:\n{text}");
+        // Real build output stays denied.
+        std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+        std::fs::write(dir.join("target/debug/gen.rs"), b"pub fn gen() {}\n").unwrap();
+        let (text, _) = handle_index(".", 1, &dirs_for(Some(dir.clone())));
+        assert!(!text.contains("gen.rs"), "target/ leaked:\n{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_truncated_walk_says_so() {
+        // The budget is exercised directly: exhausting the real MAX_WALK_ENTRIES
+        // would mean creating 20k files for one assertion.
+        let dir = tempdir("walkcut");
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        for i in 0..40 {
+            std::fs::write(dir.join(format!("pkg/f{i:03}.rs")), b"pub fn a() {}\n").unwrap();
+        }
+        let mut walk = Walk::new(10);
+        walk.collect(&dir);
+        assert!(walk.truncated, "budget exhaustion not reported");
+        assert!(
+            walk.files.len() < 40,
+            "walk should be short: {}",
+            walk.files.len()
+        );
+
+        // …and the count must not be presented as exact.
+        let header = scale_header(&dir, ".", &walk.files, walk.truncated);
+        assert!(header.contains('+'), "count not marked partial:\n{header}");
+        assert!(header.contains("LOWER BOUND"), "no caveat:\n{header}");
+
+        // A walk that fits its budget stays clean.
+        let mut full = Walk::new(MAX_WALK_ENTRIES);
+        full.collect(&dir);
+        assert!(!full.truncated);
+        assert_eq!(full.files.len(), 40);
+        let header = scale_header(&dir, ".", &full.files, full.truncated);
+        assert!(
+            !header.contains('+'),
+            "clean walk marked partial:\n{header}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn empty_directory_is_error() {
         let dir = tempdir("emptydir");
         // Extensions outside the supported set (and not on the roadmap).
@@ -839,6 +1323,9 @@ mod tests {
         let (text, is_err) = handle_index(".", 1, &dirs_for(Some(dir.clone())));
         assert!(is_err, "{text}");
         assert!(text.contains("no supported source files"), "{text}");
+        // Naming what *is* there explains the result instead of just refusing.
+        assert!(text.contains("image.png"), "{text}");
+        assert!(text.contains("data.bin"), "{text}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -997,13 +1484,9 @@ mod tests {
         std::fs::write(dir.join("real.rs"), b"pub fn real() {}\n").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(outside.join("secret.rs"), dir.join("link.rs")).unwrap();
-        let mut files = Vec::new();
-        let mut budget = MAX_WALK_ENTRIES;
-        collect_source_files(
-            &std::fs::canonicalize(&dir).unwrap(),
-            &mut files,
-            &mut budget,
-        );
+        let mut walk = Walk::new(MAX_WALK_ENTRIES);
+        walk.collect(&std::fs::canonicalize(&dir).unwrap());
+        let files = walk.files;
         assert!(
             files.iter().any(|f| f.path.ends_with("real.rs")),
             "{:?}",

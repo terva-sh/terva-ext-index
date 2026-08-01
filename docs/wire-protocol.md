@@ -45,7 +45,7 @@ Startup frames we send, in order:
 ```jsonc
 {"type":"hello","name":"index","version":"0.3.0","capabilities":["tools"],"min_protocol":2}
 {"type":"register_tool","name":"index","description":"…","schema":{…},
- "read_only":true,"authority":"local-read"}
+ "read_only":true,"authority":"local-read","essential":true}
 {"type":"register_context","text":"Prefer `index` before `read`: …"}
 {"type":"subscribe","events":["session_start"],"intercept":[]}
 {"type":"ready"}
@@ -56,6 +56,17 @@ Startup frames we send, in order:
   declared authority wins over the legacy `read_only` bool. Read-only tools are
   auto-admitted in `plan` / `auto-edit` approval modes. Lying here only cheats
   your own user's policy.
+- **`essential:true`** — keeps the tool advertised when the host has lazy tool
+  visibility on. Without it an extension is one deferred group named after the
+  extension, so every one of its tools sits behind an `activate_tools`
+  round-trip — while our `register_context` guidance, which names `index`, is in
+  context from turn one. The model reads the advice, doesn't find the tool, and
+  falls back to `read`: the exact call we were trying to avoid. The field is
+  visibility only — the tool is still permission-gated as before when called —
+  and it is additive, so an older host ignores it and a host with lazy
+  visibility off advertises everything regardless. The host caps essential tools
+  per extension (3); excess ones silently load deferred, so spend it on the tool
+  your standing context actually names.
 - **`min_protocol:2`** — the lowest host we require. We use the protocol-2
   `session_start` event to follow `cwd`; we declare 2 (not 3) because nothing
   else here needs protocol 3. Declaring more than you use refuses hosts you'd
@@ -103,7 +114,11 @@ produced). Reply within the host's tool timeout (default 60 s) with:
 `content[]` blocks are `{"type":"text",…}` or `{"type":"image",…}`; we only emit
 text. Every refusal (unsupported, oversized, out-of-workspace, unreadable) is a
 normal `is_error:true` result telling the model to fall back to `read` — never a
-crash.
+crash. The exception is a path that does not exist: `read` fails identically
+there, so the result names the nearest existing directory's contents instead.
+It is still `is_error:true` — the flag is what the host's stall detector uses to
+classify an unproductive result (`packages/core/stall.go`), and a caller that
+keeps missing paths is exactly what that should keep seeing.
 
 ### `shutdown`
 

@@ -46,6 +46,9 @@ fn handshake_and_tool_call() {
     assert_eq!(reg_tool["name"], "index");
     assert_eq!(reg_tool["read_only"], true);
     assert_eq!(reg_tool["authority"], "local-read");
+    // The standing context names this tool, so it must stay advertised even
+    // when the host defers extension tools behind activate_tools.
+    assert_eq!(reg_tool["essential"], true);
 
     let reg_ctx = read_frame(&mut reader);
     assert_eq!(reg_ctx["type"], "register_context");

@@ -81,24 +81,31 @@ download_binary() {
 		sha=$(wget -qO- "$sha_url" 2>/dev/null | awk '{print $1}' || true)
 	fi
 
-	# Verify against the published checksum (our releases always ship one).
-	if [ -n "$sha" ]; then
-		if command -v sha256sum >/dev/null 2>&1; then
-			actual=$(sha256sum "$tmp" | awk '{print $1}')
-		elif command -v shasum >/dev/null 2>&1; then
-			actual=$(shasum -a 256 "$tmp" | awk '{print $1}')
-		else
-			actual=""
-		fi
-		if [ -n "$actual" ] && [ "$actual" != "$sha" ]; then
-			echo "[index] checksum mismatch — refusing binary (want ${sha:0:12}…, got ${actual:0:12}…)." >&2
-			rm -f "$tmp"
-			return 1
-		fi
-		[ -n "$actual" ] && echo "[index] sha256 verified." >&2
-	else
-		echo "[index] warning: no published checksum found; binary not verified." >&2
+	# Verify against the published checksum. Our releases ALWAYS ship one, so a
+	# missing checksum — or no tool to check it with — is an anomaly, not a
+	# normal case. Fail closed: this binary is about to be exec'd, and an
+	# attacker who can only block the .sha256 request must not be able to
+	# downgrade us to running an unverified download.
+	if [ -z "$sha" ]; then
+		echo "[index] no published checksum at $sha_url — refusing an unverified binary." >&2
+		rm -f "$tmp"
+		return 1
 	fi
+	if command -v sha256sum >/dev/null 2>&1; then
+		actual=$(sha256sum "$tmp" | awk '{print $1}')
+	elif command -v shasum >/dev/null 2>&1; then
+		actual=$(shasum -a 256 "$tmp" | awk '{print $1}')
+	else
+		echo "[index] need sha256sum or shasum to verify the download — refusing." >&2
+		rm -f "$tmp"
+		return 1
+	fi
+	if [ "$actual" != "$sha" ]; then
+		echo "[index] checksum mismatch — refusing binary (want ${sha:0:12}…, got ${actual:0:12}…)." >&2
+		rm -f "$tmp"
+		return 1
+	fi
+	echo "[index] sha256 verified." >&2
 
 	mkdir -p "$(dirname "$bin")"
 	chmod +x "$tmp"
