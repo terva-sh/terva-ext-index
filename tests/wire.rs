@@ -91,7 +91,9 @@ fn handshake_and_tool_call() {
     let result = read_frame(&mut reader);
     assert_eq!(result["type"], "tool_result");
     assert_eq!(result["id"], "corr-1");
-    assert_eq!(result["is_error"], false);
+    // The SDK omits is_error when false (Go SDK omitempty parity), so
+    // assert "not an error" rather than an explicit false.
+    assert_ne!(result["is_error"], true, "success must not be an error");
     let text = result["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("sample.rs"), "header missing: {text}");
     assert!(
@@ -185,8 +187,8 @@ fn handshake_and_tool_call() {
     stdin.flush().unwrap();
     let moved_result = read_frame(&mut reader);
     assert_eq!(moved_result["id"], "corr-4");
-    assert_eq!(
-        moved_result["is_error"], false,
+    assert_ne!(
+        moved_result["is_error"], true,
         "cwd should follow session_start"
     );
     assert!(moved_result["content"][0]["text"]
@@ -258,7 +260,7 @@ fn directory_map_over_wire() {
 
     let result = read_frame(&mut reader);
     assert_eq!(result["id"], "dir-1");
-    assert_eq!(result["is_error"], false);
+    assert_ne!(result["is_error"], true, "a map result is not an error");
     let text = result["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("map only"), "expected a map, got:\n{text}");
     assert!(

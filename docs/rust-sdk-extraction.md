@@ -1,9 +1,22 @@
 # Pulling a Rust SDK out of `index`
 
+> **Status: implemented.** The SDK exists — `terva-extsdk`, in the
+> `terva-sh/terva-sdk-rust` repo — and `index` migrated onto it in 0.8.0
+> (`src/sandbox.rs` and the hand-rolled loop deleted; `tests/wire.rs` stayed
+> green across the refactor). The trigger was not a second extension but the
+> Matrix *connector*: extension protocol 5 carries a connector role, so the
+> connproto and extproto SDKs belong to one family, and this repo's reuse
+> boundary became the extension half's blueprint. The extraction landed
+> almost exactly as sketched below (builder + closures, sync, MVP rows only,
+> the protocol gaps closed by construction); the sketch's `ToolCall` helpers
+> and `Host`/`Jail` shapes survived nearly verbatim. Kept as the historical
+> record — section links to `sandbox.rs` and the loop describe the pre-0.8.0
+> tree.
+
 `terva-ext-index` is the **first Rust terva extension**. The Go extensions share
 `terva.sh/terva/packages/agent/ext`; there is no Rust equivalent, so this one
 hand-rolls the protocol loop. Most of that loop is not `index`-specific — see the
-[reuse boundary](architecture.md#the-reuse-boundary-what-a-rust-sdk-would-lift).
+[reuse boundary](architecture.md#the-reuse-boundary-realized-as-terva-extsdk).
 This doc sketches the SDK that boundary implies and a low-risk path to it.
 
 Nothing here is committed to yet — it's the design we'll evaluate when a **second**

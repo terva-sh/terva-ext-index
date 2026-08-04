@@ -5,9 +5,11 @@ A [terva](https://github.com/terva-sh/terva) extension that emits a file's
 line ranges — instead of its body, so the model can understand a file's
 structure cheaply before spending tokens on a full `read`.
 
-It registers a single read-only tool, `index`, and speaks the raw terva
-extension wire protocol (newline-delimited JSON over stdin/stdout) directly from
-Rust — no Go SDK. Parsing is done with [tree-sitter](https://tree-sitter.github.io/).
+It registers a single read-only tool, `index`, built on **terva-extsdk** — the
+Rust extension runtime this repo's original hand-rolled protocol loop was
+extracted into (this was the first Rust terva extension; see
+[docs/rust-sdk-extraction.md](docs/rust-sdk-extraction.md)). Parsing is done
+with [tree-sitter](https://tree-sitter.github.io/).
 
 ## Example
 
@@ -53,17 +55,15 @@ complete map and you drill in only where you look:
 
   ```
   $ index src
-  src — 3 supported files
+  src — 2 supported files
 
-  main.rs (412 lines, 11.3 KB)
+  main.rs (1348 lines, 55.0 KB)
     imports: ...
-    [59-65]  fn main()
+    [88-95]  fn main()
     ...
-  outline.rs (965 lines, 33.1 KB)
+  outline.rs (3653 lines, 130.1 KB)
     imports: tree_sitter::{Node,Parser,Tree}
-    [36-47]  pub enum Lang
-    ...
-  sandbox.rs (120 lines, 3.4 KB)
+    [36-56]  pub enum Lang
     ...
   ```
 
@@ -300,7 +300,7 @@ in it, capped at 50 entries with an `… and N more` tail:
 
 ```
 index: no such path src/mainn.rs — `mainn.rs` is not in src/, which contains:
-main.rs  outline.rs  sandbox.rs
+main.rs  outline.rs
 ```
 
 Missed paths are usually structurally right and filename-wrong, so the listing
@@ -356,11 +356,14 @@ Rust toolchain, then execs it. No platform-specific binary is committed.
 extension.json   manifest (name "index", version, exec "./run.sh")
 run.sh           launcher: build from source (or download the latest prebuilt
                  binary if cargo is unavailable) on first launch, then exec
-Cargo.toml       pinned tree-sitter + grammar crate versions (ABI-matched)
-src/main.rs      protocol loop: handshake, read frames, dispatch tool_call,
-                 session_start cwd-refresh, shutdown (thin glue; stdout is the
-                 wire, all chatter to stderr)
-src/sandbox.rs   path confinement (the self-jail); pure + unit-tested
+Cargo.toml       pinned tree-sitter + grammar crate versions (ABI-matched),
+                 plus the terva-extsdk dependency (path during co-development;
+                 pinned for release — run.sh refuses a half-resolvable tree)
+src/main.rs      the `index` domain on terva-extsdk: the Extension declaration
+                 (schema, guidance, one handler) plus path resolution, miss
+                 reporting, and the directory-mode rendering. The wire itself —
+                 handshake, framing, session_start cwd-refresh, the self-jail —
+                 lives in the SDK
 src/outline.rs   the pure tree-sitter walk -> skeleton (unit-tested in isolation)
 tests/wire.rs    end-to-end: pipe hello_ack + tool_call into the built binary,
                  assert the tool_result frame (incl. jail + session_start cases)
@@ -381,7 +384,8 @@ error pointing the model at `read` instead.
 
 The confinement mirrors terva's own `tools/sandbox.go`: the target and each
 root are canonicalized (symlinks resolved), then the target must be a root or a
-descendant. If the agent genuinely needs a file outside the project, that's a
+descendant. The `Jail` implementing this was born here as `src/sandbox.rs` and
+now ships in terva-extsdk, so every Rust extension gets the same discipline. If the agent genuinely needs a file outside the project, that's a
 deliberate act through the host `read` tool (which *can* be unjailed) or by
 copying the file in — never something `index` does implicitly.
 
@@ -400,15 +404,18 @@ instead of deferring it behind an activation round-trip the standing guidance
 below would have already sent you past),
 `register_context` (the "prefer index before read" standing guidance),
 `subscribe` (for `session_start`), and `ready` — all eagerly before
-`hello_ack`, matching the Go SDK. It then reads frames and handles `hello_ack`
-(capturing `cwd` / `data_dir` / `extension_dir`), `event` (`session_start`
-cwd-refresh), `tool_call`, and `shutdown`.
+`hello_ack`, matching the Go SDK. All of that is terva-extsdk's run loop; this
+repo only declares the tool and handles the calls. The SDK reads frames with
+the 4 MiB cap, captures `cwd` / `data_dir` / `extension_dir` from `hello_ack`,
+refreshes `cwd` on `session_start`, isolates handler panics, and answers
+`shutdown`.
 
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md) — module map and the
-  reusable-vs-`index`-specific boundary.
+  reuse boundary that became terva-extsdk.
 - [docs/wire-protocol.md](docs/wire-protocol.md) — the terva extension protocol
-  as implemented here (the contract reference).
-- [docs/rust-sdk-extraction.md](docs/rust-sdk-extraction.md) — sketch + plan for
-  pulling a Rust SDK out of this first Rust extension.
+  as spoken here (the contract the SDK enforces on our behalf).
+- [docs/rust-sdk-extraction.md](docs/rust-sdk-extraction.md) — the sketch + plan
+  that pulled the Rust SDK out of this first Rust extension (implemented;
+  kept as the historical record).

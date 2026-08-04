@@ -25,6 +25,17 @@ bin="target/release/terva-ext-index"
 # .github/workflows/release.yml.
 RELEASE_BASE="${TERVA_EXT_INDEX_RELEASE_BASE:-https://github.com/terva-sh/terva-ext-index/releases}"
 
+# During SDK co-development Cargo.toml carries a workspace-relative path
+# dependency on terva-extsdk (a release tree pins it instead). An installed
+# COPY of this repo cannot resolve that path, and the prebuilt-release
+# fallback below would then silently run a STALE version against these
+# sources. Fail loudly instead.
+sdk_dep_missing() {
+	local sdk_path
+	sdk_path=$(sed -nE 's/^terva-extsdk *= *\{ *path *= *"([^"]+)".*/\1/p' Cargo.toml | head -1)
+	[ -n "$sdk_path" ] && [ ! -d "$sdk_path" ]
+}
+
 needs_build() {
 	[ -x "$bin" ] || return 0
 	# Rebuild if any source or the manifest is newer than the binary.
@@ -114,6 +125,12 @@ download_binary() {
 }
 
 if needs_build; then
+	if sdk_dep_missing; then
+		echo "[index] Cargo.toml path-depends on terva-extsdk, which is not present at this location." >&2
+		echo "[index] Build from the source checkout (terva-sdk-rust as a sibling) and install with 'just install'," >&2
+		echo "[index] or use a release tree, which pins the SDK dependency." >&2
+		exit 1
+	fi
 	if command -v cargo >/dev/null 2>&1; then
 		echo "[index] building $bin (first launch or sources changed)…" >&2
 		# A C compiler is also needed to build the tree-sitter grammars; cargo

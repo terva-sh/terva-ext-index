@@ -1,8 +1,11 @@
 name: CI
 
-# Runs on the public GitHub mirror (the curated `release` branch) and, where
-# Forgejo Actions is enabled, on the internal `main` too — both read this file
-# (Forgejo also looks under .github/workflows/). Mirrors `just ci`.
+# GitHub only. Forgejo Actions also reads .github/workflows/, so without a guard
+# this fires on every internal push as well — burning a runner to re-check what
+# `just ci` already gates locally, against a runner image the internal instance
+# may not even provide. The job-level `if` matches release.yml, which has always
+# guarded this way; on Forgejo the workflow is still evaluated but the job is
+# skipped. Mirrors `just ci`.
 on:
   push:
   pull_request:
@@ -12,6 +15,7 @@ permissions:
 
 jobs:
   test:
+    if: github.server_url == 'https://github.com'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

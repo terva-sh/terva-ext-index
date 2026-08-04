@@ -1,33 +1,36 @@
 //! terva `index` extension (Rust).
 //!
-//! Speaks the raw terva extension wire protocol (newline-delimited JSON over
-//! stdin/stdout). It registers a single read-only tool, `index`, that emits a
-//! file's tree-sitter skeleton — imports plus type/function/class signatures
-//! with exact line ranges — so the model can understand a file's structure
+//! Registers a single read-only tool, `index`, that emits a file's
+//! tree-sitter skeleton — imports plus type/function/class signatures with
+//! exact line ranges — so the model can understand a file's structure
 //! cheaply before spending tokens on a full `read`.
+//!
+//! The wire protocol lives in `terva-extsdk` (this repo was the extension
+//! that proved the extraction — see docs/rust-sdk-extraction.md): the SDK
+//! owns the handshake, LF-JSON framing with the 4 MiB cap, `session_start`
+//! cwd-following, panic-isolated dispatch, and the self-`Jail`. This file
+//! is the `index` domain only: the tool's schema and guidance, path
+//! resolution and miss reporting, and the file/directory outline dispatch.
 //!
 //! HARD RULE: stdout is the protocol wire. Every diagnostic byte goes to
 //! stderr (terva captures it to $TERVA_HOME/logs/ext-index.log). One stray
 //! stdout write corrupts the JSON stream.
 //!
 //! Sandbox: like every terva extension, `index` self-jails. It only outlines
-//! files inside the workspace (`cwd`) or its own data/extension dirs; there is
-//! no unjail. See `sandbox.rs`.
+//! files inside the workspace (`cwd`) or its own data/extension dirs; there
+//! is no unjail.
 
 mod outline;
-mod sandbox;
 
 use std::collections::{HashMap, HashSet};
-use std::io::{self, BufRead, Read, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Value};
-
-use sandbox::{Jail, JailError};
+use terva_extsdk::{read_bounded, Authority, Extension, Jail, JailError, Tool, ToolResult};
 
 /// Kept equal to Cargo.toml's `version` and extension.json's `version` by the
 /// `version_matches_manifests` test below; bump all three together on release.
-const VERSION: &str = "0.7.0";
+const VERSION: &str = "0.8.0";
 
 /// We use the protocol-2 `session_start` event to follow `cwd` across `/cd`
 /// (so the jail tracks the live working directory). That is the lowest host
@@ -77,245 +80,77 @@ const STANDING_CONTEXT: &str =
      ~2 MB, or files outside the project, it returns an error telling you to use \
      `read`.";
 
+/// The tool's JSON Schema. Written on ONE line by SDK requirement: the
+/// schema passes to the wire byte-exact (never re-serialized), and the wire
+/// is LF-delimited — a pretty-printed schema would corrupt the stream.
+const SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"file or directory to outline (inside the workspace)"},"depth":{"type":"integer","minimum":0,"description":"nesting levels to descend (default 1; 0 = top-level only)"}},"required":["path"]}"#;
+
 fn main() {
-    if let Err(e) = run() {
-        // A real IO error on the wire (EOF is handled inside run()).
+    if let Err(e) = extension().run() {
+        // A real IO error on the wire, or a refused handshake (EOF and
+        // shutdown are clean exits inside the SDK's run loop).
         eprintln!("[index] fatal: {e}");
         std::process::exit(1);
     }
 }
 
-/// Host-provided locations captured from the handshake. `cwd` refreshes on
-/// every `session_start` (e.g. after `/cd`); `data_dir`/`extension_dir` are
-/// fixed for the process lifetime.
-#[derive(Default)]
-struct HostDirs {
-    cwd: Option<PathBuf>,
-    data_dir: Option<PathBuf>,
-    extension_dir: Option<PathBuf>,
-}
-
-impl HostDirs {
-    /// The jail roots the `index` tool is allowed to read inside: the
-    /// workspace plus the extension's own dirs. Falls back to the process cwd
-    /// if the host never sent one, so we never end up with an empty (refuse-
-    /// everything) jail on a well-behaved host that omitted the field.
-    fn jail(&self) -> Jail {
-        let mut roots: Vec<PathBuf> = Vec::new();
-        match &self.cwd {
-            Some(c) => roots.push(c.clone()),
-            None => {
-                if let Ok(d) = std::env::current_dir() {
-                    roots.push(d);
+/// The `index` extension, declared on terva-extsdk. The SDK registers
+/// eagerly (hello / register_tool / register_context / subscribe / ready),
+/// follows `session_start` so the jail tracks the live `cwd`, and isolates
+/// handler panics (one bad file answers an error result instead of taking
+/// the tool out for the rest of the session).
+fn extension() -> Extension {
+    Extension::new("index", VERSION)
+        .min_protocol(MIN_PROTOCOL)
+        .context(STANDING_CONTEXT)
+        .follow_cwd()
+        .tool(
+            Tool::new("index", TOOL_DESC, SCHEMA)
+                .read_only()
+                .authority(Authority::LocalRead)
+                // Our standing guidance ("prefer `index` before `read`") is
+                // always in the model's context, so the tool it names has to
+                // be advertised from turn one. Under lazy tool visibility an
+                // extension's tools otherwise defer behind an activate_tools
+                // round-trip, and the first read usually lands before the
+                // model thinks to activate us — exactly the read the guidance
+                // exists to prevent. Additive: a host that predates the field
+                // ignores it, and one with lazy visibility off advertises
+                // everything anyway.
+                .essential(),
+            |call, host| {
+                let path_arg = call.arg_str("path").unwrap_or("");
+                let depth = call.arg_u64("depth").unwrap_or(1).min(MAX_DEPTH) as usize;
+                let (text, is_error) = handle_index(path_arg, depth, host.cwd(), &host.jail());
+                if is_error {
+                    ToolResult::error(text)
+                } else {
+                    ToolResult::text(text)
                 }
-            }
-        }
-        if let Some(d) = &self.data_dir {
-            roots.push(d.clone());
-        }
-        if let Some(e) = &self.extension_dir {
-            roots.push(e.clone());
-        }
-        Jail::new(roots)
-    }
-}
-
-fn run() -> io::Result<()> {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-
-    // --- Handshake: hello, register_tool, register_context, subscribe, ready.
-    // Sent eagerly before hello_ack, matching the Go SDK: the host buffers
-    // registrations until `ready` and replies with hello_ack we read below.
-    send(
-        &mut out,
-        &json!({
-            "type": "hello",
-            "name": "index",
-            "version": VERSION,
-            "capabilities": ["tools"],
-            "min_protocol": MIN_PROTOCOL,
-        }),
-    )?;
-    send(
-        &mut out,
-        &json!({
-            "type": "register_tool",
-            "name": "index",
-            "description": TOOL_DESC,
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "file or directory to outline (inside the workspace)" },
-                    "depth": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "nesting levels to descend (default 1; 0 = top-level only)"
-                    }
-                },
-                "required": ["path"]
             },
-            "read_only": true,
-            "authority": "local-read",
-            // Our standing guidance ("prefer `index` before `read`") is always
-            // in the model's context, so the tool it names has to be advertised
-            // from turn one. Under lazy tool visibility an extension's tools
-            // otherwise defer behind an `activate_tools` round-trip, and the
-            // first read usually lands before the model thinks to activate us —
-            // exactly the read the guidance exists to prevent. Additive: a host
-            // that predates the field ignores it, and one with lazy visibility
-            // off advertises everything anyway.
-            "essential": true,
-        }),
-    )?;
-    send(
-        &mut out,
-        &json!({
-            "type": "register_context",
-            "text": STANDING_CONTEXT,
-        }),
-    )?;
-    // Follow the working directory across `/cd` so the jail never goes stale.
-    send(
-        &mut out,
-        &json!({
-            "type": "subscribe",
-            "events": ["session_start"],
-            "intercept": [],
-        }),
-    )?;
-    send(&mut out, &json!({ "type": "ready" }))?;
-
-    // --- Read loop. ---------------------------------------------------------
-    let stdin = io::stdin();
-    let mut dirs = HostDirs::default();
-    let mut reader = stdin.lock();
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            // EOF: the host closed the wire. Exit cleanly.
-            return Ok(());
-        }
-        let trimmed = line.trim_end_matches(['\n', '\r']);
-        if trimmed.is_empty() {
-            continue;
-        }
-        let frame: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[index] skipping unparseable frame: {e}");
-                continue;
-            }
-        };
-        let ftype = frame.get("type").and_then(Value::as_str).unwrap_or("");
-        match ftype {
-            "hello_ack" => {
-                dirs.cwd = path_field(&frame, "cwd").or(dirs.cwd.take());
-                dirs.data_dir = path_field(&frame, "data_dir");
-                dirs.extension_dir = path_field(&frame, "extension_dir");
-                eprintln!(
-                    "[index] ready; cwd={:?} data_dir={:?} extension_dir={:?} protocol={:?}",
-                    dirs.cwd,
-                    dirs.data_dir,
-                    dirs.extension_dir,
-                    frame.get("protocol_version")
-                );
-            }
-            "event" => {
-                // session_start re-fires on every `/cd`; keep cwd current.
-                if frame.get("event").and_then(Value::as_str) == Some("session_start") {
-                    if let Some(c) = path_field(&frame, "cwd") {
-                        eprintln!("[index] session_start: cwd -> {}", c.display());
-                        dirs.cwd = Some(c);
-                    }
-                }
-            }
-            "tool_call" => {
-                let id = frame
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let args = frame.get("args");
-                let path_arg = args
-                    .and_then(|a| a.get("path"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let depth = args
-                    .and_then(|a| a.get("depth"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(1)
-                    .min(MAX_DEPTH) as usize;
-                // One bad file must not take the tool out for the rest of the
-                // session. `handle_index` is read-only and owns no shared state,
-                // so catching an unwind here loses nothing — the default panic
-                // hook has already written the details to stderr, which terva
-                // captures to its extension log. (A grammar segfault is still
-                // fatal; that is not the failure this guards.)
-                let call = std::panic::AssertUnwindSafe(|| handle_index(path_arg, depth, &dirs));
-                let (text, is_error) = std::panic::catch_unwind(call).unwrap_or_else(|_| {
-                    (
-                        format!(
-                            "index: internal error while outlining {path_arg} (see the extension \
-                             log). The tool is still running; fall back to `read` for this file."
-                        ),
-                        true,
-                    )
-                });
-                send(
-                    &mut out,
-                    &json!({
-                        "type": "tool_result",
-                        "id": id,
-                        "content": [{ "type": "text", "text": text }],
-                        "is_error": is_error,
-                    }),
-                )?;
-            }
-            "shutdown" => {
-                send(&mut out, &json!({ "type": "shutdown_ack" }))?;
-                return Ok(());
-            }
-            other => {
-                // Unknown / unhandled frame: ignore (panel frames, etc.).
-                if !other.is_empty() {
-                    eprintln!("[index] ignoring frame type {other:?}");
-                }
-            }
-        }
-    }
-}
-
-/// Read a non-empty string field as a PathBuf.
-fn path_field(frame: &Value, key: &str) -> Option<PathBuf> {
-    frame
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
+        )
 }
 
 /// Resolve the path, confine it to the jail, read it (bounded), and outline.
-/// `depth` is the nesting depth passed to the outliner. Returns (text, is_error).
-fn handle_index(path_arg: &str, depth: usize, dirs: &HostDirs) -> (String, bool) {
+/// `depth` is the nesting depth passed to the outliner; `cwd` and `jail` come
+/// from the SDK's [`terva_extsdk::Host`] (the jail is the workspace plus the
+/// extension's own dirs, falling back to the process cwd when the host never
+/// sent one). Returns (text, is_error).
+fn handle_index(path_arg: &str, depth: usize, cwd: Option<&Path>, jail: &Jail) -> (String, bool) {
     if path_arg.is_empty() {
         return ("index: missing `path` argument.".into(), true);
     }
-    let resolved = resolve_path(path_arg, dirs.cwd.as_deref());
+    let resolved = resolve_path(path_arg, cwd);
 
     // Confine to the workspace. This both canonicalizes (resolving symlinks,
     // which defeats a symlink that escapes the workspace) and confirms the
     // result is inside a jail root.
-    let jail = dirs.jail();
     let canon = match jail.resolve(&resolved) {
         Ok(p) => p,
         // A path that does not exist is answered, not just refused: see
         // `path_miss_message`. Notably it does *not* suggest `read` — `read`
         // hits the same ENOENT one call later.
-        Err(JailError::NotFound(e)) => return (path_miss_message(&resolved, &e, &jail, dirs), true),
+        Err(JailError::NotFound(e)) => return (path_miss_message(&resolved, &e, jail, cwd), true),
         Err(JailError::Outside) => {
             return (
                 format!(
@@ -409,8 +244,8 @@ const MISS_LIST_ENTRIES: usize = 50;
 /// right and filename-wrong (`save.go` asked for, only `save_test.go` present),
 /// and without the listing the misses chain inside one directory. See
 /// `docs/proposals/path-miss-guidance.md`.
-fn path_miss_message(resolved: &Path, err: &io::Error, jail: &Jail, dirs: &HostDirs) -> String {
-    let asked = workspace_display(resolved, dirs);
+fn path_miss_message(resolved: &Path, err: &io::Error, jail: &Jail, cwd: Option<&Path>) -> String {
+    let asked = workspace_display(resolved, cwd);
 
     let Some((dir, missing)) = nearest_existing_ancestor(resolved, jail) else {
         return format!(
@@ -419,7 +254,7 @@ fn path_miss_message(resolved: &Path, err: &io::Error, jail: &Jail, dirs: &HostD
         );
     };
     // `.` is the workspace root itself, where "in ./" reads badly.
-    let here = match workspace_display(&dir, dirs) {
+    let here = match workspace_display(&dir, cwd) {
         d if d == "." => "the workspace root".to_string(),
         d => format!("{d}/"),
     };
@@ -516,8 +351,8 @@ fn render_entries(names: &[String], total: usize) -> String {
 /// Path as the caller thinks of it: relative to the workspace when it is inside
 /// one, else absolute. Tries the raw `cwd` and its canonical form, since a
 /// resolved-but-missing path has been through neither.
-fn workspace_display(path: &Path, dirs: &HostDirs) -> String {
-    if let Some(cwd) = dirs.cwd.as_deref() {
+fn workspace_display(path: &Path, cwd: Option<&Path>) -> String {
+    if let Some(cwd) = cwd {
         let roots = [Some(cwd.to_path_buf()), std::fs::canonicalize(cwd).ok()];
         for root in roots.into_iter().flatten() {
             if let Ok(rel) = path.strip_prefix(&root) {
@@ -911,18 +746,6 @@ fn scale_header(dir: &Path, display: &str, files: &[WalkFile], truncated: bool) 
     )
 }
 
-/// Read up to `max` bytes; `Ok(None)` means the file exceeded the cap.
-fn read_bounded(path: &Path, max: usize) -> io::Result<Option<Vec<u8>>> {
-    let f = std::fs::File::open(path)?;
-    let mut buf = Vec::new();
-    f.take(max as u64 + 1).read_to_end(&mut buf)?;
-    if buf.len() > max {
-        Ok(None)
-    } else {
-        Ok(Some(buf))
-    }
-}
-
 /// Number of lines in `bytes`: the newline count, plus one for a final line
 /// with no trailing newline (so `a\nb` and `a\nb\n` both report 2). An empty
 /// file reports 0.
@@ -1008,16 +831,10 @@ fn display_name(path_arg: &str, resolved: &Path) -> String {
         .unwrap_or_else(|| path_arg.to_string())
 }
 
-fn send<W: Write>(out: &mut W, frame: &Value) -> io::Result<()> {
-    let mut s = serde_json::to_string(frame).expect("serialize frame");
-    s.push('\n');
-    out.write_all(s.as_bytes())?;
-    out.flush()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     fn tempdir(tag: &str) -> PathBuf {
         let d =
@@ -1026,12 +843,15 @@ mod tests {
         d
     }
 
-    fn dirs_for(cwd: Option<PathBuf>) -> HostDirs {
-        HostDirs {
-            cwd,
-            data_dir: None,
-            extension_dir: None,
-        }
+    /// Drive `handle_index` the way the production handler does: the jail is
+    /// the workspace root, falling back to the process cwd when the host
+    /// never sent one — mirroring `terva_extsdk::Host::jail`.
+    fn run_index(path: &str, depth: usize, cwd: Option<&Path>) -> (String, bool) {
+        let jail = match cwd {
+            Some(c) => Jail::new([c]),
+            None => Jail::new(std::env::current_dir()),
+        };
+        handle_index(path, depth, cwd, &jail)
     }
 
     #[test]
@@ -1048,7 +868,7 @@ mod tests {
 
     #[test]
     fn missing_file_is_error() {
-        let (text, is_err) = handle_index("/nope/does-not-exist.rs", 1, &dirs_for(None));
+        let (text, is_err) = run_index("/nope/does-not-exist.rs", 1, None);
         assert!(is_err);
         // Nothing above it is inside the jail, so there is no listing to give —
         // but it must still not send the caller to `read`, which fails the same.
@@ -1062,7 +882,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("store/save")).unwrap();
         std::fs::write(dir.join("store/save/save_test.go"), b"package save\n").unwrap();
         std::fs::write(dir.join("store/save/replay.go"), b"package save\n").unwrap();
-        let (text, is_err) = handle_index("store/save/save.go", 1, &dirs_for(Some(dir.clone())));
+        let (text, is_err) = run_index("store/save/save.go", 1, Some(&dir));
         assert!(is_err, "{text}");
         assert!(text.contains("`save.go` is not in store/save/"), "{text}");
         assert!(text.contains("save_test.go"), "sibling missing:\n{text}");
@@ -1077,7 +897,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("internal")).unwrap();
         std::fs::write(dir.join("internal/real.rs"), b"pub fn r() {}\n").unwrap();
         // Two components missing: `nope/` and the file under it.
-        let (text, is_err) = handle_index("internal/nope/x.rs", 1, &dirs_for(Some(dir.clone())));
+        let (text, is_err) = run_index("internal/nope/x.rs", 1, Some(&dir));
         assert!(is_err, "{text}");
         assert!(
             text.contains("`nope` is not in internal/"),
@@ -1091,7 +911,7 @@ mod tests {
     fn path_miss_at_the_workspace_root_reads_naturally() {
         let dir = tempdir("miss-root");
         std::fs::write(dir.join("main.rs"), b"pub fn m() {}\n").unwrap();
-        let (text, is_err) = handle_index("gone.rs", 1, &dirs_for(Some(dir.clone())));
+        let (text, is_err) = run_index("gone.rs", 1, Some(&dir));
         assert!(is_err, "{text}");
         assert!(text.contains("not in the workspace root"), "{text}");
         assert!(text.contains("main.rs"), "{text}");
@@ -1105,7 +925,7 @@ mod tests {
         for i in 0..n {
             std::fs::write(dir.join(format!("f{i:03}.rs")), b"pub fn a() {}\n").unwrap();
         }
-        let (text, is_err) = handle_index("gone.rs", 1, &dirs_for(Some(dir.clone())));
+        let (text, is_err) = run_index("gone.rs", 1, Some(&dir));
         assert!(is_err, "{text}");
         assert!(
             text.contains(&format!("… and 12 more ({n} total)")),
@@ -1125,7 +945,7 @@ mod tests {
     fn path_miss_lists_hidden_entries() {
         let dir = tempdir("miss-hidden");
         std::fs::write(dir.join(".env.local"), b"K=v\n").unwrap();
-        let (text, _) = handle_index(".env", 1, &dirs_for(Some(dir.clone())));
+        let (text, _) = run_index(".env", 1, Some(&dir));
         assert!(
             text.contains(".env.local"),
             "a listing that hides the answer is worse than a long one:\n{text}"
@@ -1138,7 +958,7 @@ mod tests {
         // The climb must stop at the jail root rather than listing a parent of
         // the workspace. `/etc/nope.rs` has an existing parent — outside the jail.
         let dir = tempdir("miss-outside");
-        let (text, is_err) = handle_index("/etc/nope.rs", 1, &dirs_for(Some(dir.clone())));
+        let (text, is_err) = run_index("/etc/nope.rs", 1, Some(&dir));
         assert!(is_err, "{text}");
         assert!(
             !text.contains("which contains"),
@@ -1149,7 +969,7 @@ mod tests {
 
     #[test]
     fn empty_path_is_error() {
-        let (_t, is_err) = handle_index("", 1, &dirs_for(None));
+        let (_t, is_err) = run_index("", 1, None);
         assert!(is_err);
     }
 
@@ -1157,7 +977,7 @@ mod tests {
     fn outlines_file_inside_workspace() {
         let dir = tempdir("inside");
         std::fs::write(dir.join("a.rs"), b"pub fn hi() {}\n").unwrap();
-        let (text, is_err) = handle_index("a.rs", 1, &dirs_for(Some(dir.clone())));
+        let (text, is_err) = run_index("a.rs", 1, Some(&dir));
         assert!(!is_err, "{text}");
         assert!(text.contains("pub fn hi()"), "{text}");
         std::fs::remove_dir_all(&dir).ok();
@@ -1171,12 +991,12 @@ mod tests {
             b"mod m {\n    impl S {\n        pub fn deep(&self) {}\n    }\n}\n",
         )
         .unwrap();
-        let (shallow, _) = handle_index("n.rs", 1, &dirs_for(Some(dir.clone())));
+        let (shallow, _) = run_index("n.rs", 1, Some(&dir));
         assert!(
             !shallow.contains("fn deep"),
             "depth 1 should not reach it:\n{shallow}"
         );
-        let (deep, _) = handle_index("n.rs", 2, &dirs_for(Some(dir.clone())));
+        let (deep, _) = run_index("n.rs", 2, Some(&dir));
         assert!(
             deep.contains("pub fn deep(&self)"),
             "depth 2 should reach it:\n{deep}"
@@ -1191,8 +1011,7 @@ mod tests {
         let secret = elsewhere.join("secret.rs");
         std::fs::write(&secret, b"pub fn leak() {}\n").unwrap();
         // Absolute path that exists but is outside the jail root.
-        let (text, is_err) =
-            handle_index(secret.to_str().unwrap(), 1, &dirs_for(Some(work.clone())));
+        let (text, is_err) = run_index(secret.to_str().unwrap(), 1, Some(&work));
         assert!(is_err, "out-of-workspace read should be refused: {text}");
         assert!(text.contains("outside the workspace"), "{text}");
         std::fs::remove_dir_all(&work).ok();
@@ -1204,7 +1023,7 @@ mod tests {
         let work = tempdir("traverse-work");
         let parent = work.parent().unwrap().to_path_buf();
         std::fs::write(parent.join("outside.rs"), b"pub fn x() {}\n").unwrap();
-        let (text, is_err) = handle_index("../outside.rs", 1, &dirs_for(Some(work.clone())));
+        let (text, is_err) = run_index("../outside.rs", 1, Some(&work));
         assert!(is_err, "`..` traversal should be refused: {text}");
         assert!(text.contains("outside the workspace"), "{text}");
         std::fs::remove_dir_all(&work).ok();
@@ -1223,7 +1042,7 @@ mod tests {
         std::fs::write(dir.join("node_modules/pkg/c.js"), b"function c() {}\n").unwrap();
         std::fs::write(dir.join(".hidden/d.rs"), b"pub fn d() {}\n").unwrap();
 
-        let (text, is_err) = handle_index(".", 1, &dirs_for(Some(dir.clone())));
+        let (text, is_err) = run_index(".", 1, Some(&dir));
         assert!(!is_err, "{text}");
         assert!(text.contains("supported files"), "summary missing:\n{text}");
         assert!(text.contains("pub fn a()"), "{text}");
@@ -1249,7 +1068,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join(".venv/lib/junk.py"), b"def junk():\n    pass\n").unwrap();
         std::fs::write(dir.join("a.rs"), b"pub fn a() {}\n").unwrap();
-        let (text, is_err) = handle_index(".", 1, &dirs_for(Some(dir.clone())));
+        let (text, is_err) = run_index(".", 1, Some(&dir));
         assert!(!is_err, "{text}");
         assert!(
             text.contains(".github/workflows/ci.yml"),
@@ -1267,13 +1086,13 @@ mod tests {
         std::fs::create_dir_all(dir.join("src/bin")).unwrap();
         std::fs::write(dir.join("src/lib.rs"), b"pub fn lib() {}\n").unwrap();
         std::fs::write(dir.join("src/bin/tool.rs"), b"pub fn tool() {}\n").unwrap();
-        let (text, is_err) = handle_index(".", 1, &dirs_for(Some(dir.clone())));
+        let (text, is_err) = run_index(".", 1, Some(&dir));
         assert!(!is_err, "{text}");
         assert!(text.contains("src/bin/tool.rs"), "bin/ skipped:\n{text}");
         // Real build output stays denied.
         std::fs::create_dir_all(dir.join("target/debug")).unwrap();
         std::fs::write(dir.join("target/debug/gen.rs"), b"pub fn gen() {}\n").unwrap();
-        let (text, _) = handle_index(".", 1, &dirs_for(Some(dir.clone())));
+        let (text, _) = run_index(".", 1, Some(&dir));
         assert!(!text.contains("gen.rs"), "target/ leaked:\n{text}");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1320,7 +1139,7 @@ mod tests {
         // Extensions outside the supported set (and not on the roadmap).
         std::fs::write(dir.join("image.png"), b"\x89PNG\r\n").unwrap();
         std::fs::write(dir.join("data.bin"), b"\x00\x01\x02").unwrap();
-        let (text, is_err) = handle_index(".", 1, &dirs_for(Some(dir.clone())));
+        let (text, is_err) = run_index(".", 1, Some(&dir));
         assert!(is_err, "{text}");
         assert!(text.contains("no supported source files"), "{text}");
         // Naming what *is* there explains the result instead of just refusing.
@@ -1349,7 +1168,7 @@ mod tests {
         std::fs::write(dir.join("a.rs"), b"pub fn a() {}\n").unwrap();
         // A direct `index .env` works (dotfile bypasses the walk's hidden filter)
         // and never leaks the value.
-        let (text, is_err) = handle_index(".env", 1, &dirs_for(Some(dir.clone())));
+        let (text, is_err) = run_index(".env", 1, Some(&dir));
         assert!(!is_err, "{text}");
         assert!(
             text.contains("SECRET_TOKEN") && text.contains("PORT"),
@@ -1357,7 +1176,7 @@ mod tests {
         );
         assert!(!text.contains("abc123"), "value leaked:\n{text}");
         // The directory walk surfaces the dotfile config despite the hidden filter.
-        let (dirtext, _) = handle_index(".", 1, &dirs_for(Some(dir.clone())));
+        let (dirtext, _) = run_index(".", 1, Some(&dir));
         assert!(dirtext.contains(".env"), "dotfile not in walk:\n{dirtext}");
         assert!(
             !dirtext.contains("abc123"),
@@ -1371,7 +1190,7 @@ mod tests {
         let dir = tempdir("sizehint");
         // Two lines, no trailing-newline ambiguity.
         std::fs::write(dir.join("a.rs"), b"pub fn a() {}\npub fn b() {}\n").unwrap();
-        let (text, is_err) = handle_index(".", 1, &dirs_for(Some(dir.clone())));
+        let (text, is_err) = run_index(".", 1, Some(&dir));
         assert!(!is_err, "{text}");
         // The file's header line carries `(N lines, X B/KB)`.
         assert!(
@@ -1387,7 +1206,7 @@ mod tests {
         for i in 0..3 {
             std::fs::write(dir.join(format!("f{i}.rs")), b"pub fn hello() {}\n").unwrap();
         }
-        let (text, is_err) = handle_index(".", 1, &dirs_for(Some(dir.clone())));
+        let (text, is_err) = run_index(".", 1, Some(&dir));
         assert!(!is_err, "{text}");
         // The package case is unchanged: real skeleton bodies, no map/rollup header.
         assert!(text.contains("pub fn hello()"), "skeleton missing:\n{text}");
@@ -1414,7 +1233,7 @@ mod tests {
             )
             .unwrap();
         }
-        let (text, is_err) = handle_index(".", 1, &dirs_for(Some(dir.clone())));
+        let (text, is_err) = run_index(".", 1, Some(&dir));
         assert!(!is_err, "{text}");
         assert!(text.contains("map only"), "map header missing:\n{text}");
         // A map carries size hints but no skeleton body.
@@ -1449,7 +1268,7 @@ mod tests {
             .unwrap();
         }
         // depth: 2 must NOT re-inflate the rollup — it's depth-blind.
-        let (text, is_err) = handle_index(".", 2, &dirs_for(Some(dir.clone())));
+        let (text, is_err) = run_index(".", 2, Some(&dir));
         assert!(!is_err, "{text}");
         assert!(text.contains("rolled up"), "rollup header missing:\n{text}");
         // One line per immediate child dir, not per file.
@@ -1499,19 +1318,6 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&outside).ok();
-    }
-
-    #[test]
-    fn session_start_updates_cwd() {
-        let mut dirs = HostDirs::default();
-        let ev = json!({"type":"event","event":"session_start","cwd":"/new/place"});
-        // Mirror the loop's handling.
-        if ev.get("event").and_then(Value::as_str) == Some("session_start") {
-            if let Some(c) = path_field(&ev, "cwd") {
-                dirs.cwd = Some(c);
-            }
-        }
-        assert_eq!(dirs.cwd, Some(PathBuf::from("/new/place")));
     }
 
     #[test]

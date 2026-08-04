@@ -1,9 +1,11 @@
 # Wire protocol (as implemented here)
 
 What `terva-ext-index` actually speaks, and where the contract lives in the host
-repo. This is the subset a [Rust SDK](rust-sdk-extraction.md) would encapsulate;
-it is **not** the full protocol (commands, panels, event interception,
-`host_tool_call`, context cards — none of which `index` uses).
+repo. Since 0.8.0 this subset is encapsulated by **terva-extsdk** (the SDK this
+repo's loop was [extracted into](rust-sdk-extraction.md)) — the doc remains the
+map of the contract the SDK enforces on our behalf. It is **not** the full
+protocol (commands, panels, event interception, `host_tool_call`, context
+cards — none of which `index` uses).
 
 > **Source of truth:** the terva repo, `terva.sh/terva`
 > ([github.com/terva-sh/terva](https://github.com/terva-sh/terva)).
@@ -27,10 +29,10 @@ terva launches the manifest's `exec` (`./run.sh`) as a subprocess.
   `MaxToolCallBytes` = 1 MiB for the args the host puts in one `tool_call`. An
   oversized inbound frame is **skipped and logged, never fatal**. We keep our
   own output well under these (see the caps in `outline.rs`).
-  - ⚠️ Gap: our `main.rs` read loop uses `BufRead::read_line`, which does not
-    enforce the 4 MiB read cap the Go SDK applies (`extproto.ReadFrame`). A
-    hostile/buggy host could stream an unbounded line. Low risk (the host is
-    trusted), but an SDK should match `ReadFrame`.
+  - The old ⚠️ gap here — the hand-rolled `read_line` loop not enforcing the
+    4 MiB read cap — is closed: terva-extsdk reads through `terva-wire`'s
+    `FrameReader`, which matches `extproto.ReadFrame` (bounded read, constant-
+    memory drain of an oversized line).
 
 ## Handshake (ordering matters)
 
@@ -130,12 +132,15 @@ Extensions confine their own filesystem access — and, unlike host-side tools,
 there is **no unjail**. We only resolve paths inside `cwd ∪ data_dir ∪
 extension_dir`. The confinement mirrors `tools/sandbox.go`: canonicalize
 (symlink-resolve) the target and each root, then require the target to be a root
-or a descendant. See [architecture.md](architecture.md) and `src/sandbox.rs`.
+or a descendant. The `Jail` was born here as `src/sandbox.rs` and now lives in
+terva-extsdk (lifted wholesale, tests included); see
+[architecture.md](architecture.md).
 
 ## What we deliberately don't implement
 
 `register_command` / `command_invoked`, panels (`open_panel` / `panel_*`),
 event **interception** (`event_intercept` / `_response`), `host_tool_call`,
 `list_sessions` / `read_session`, `context_card` / `refresh_context` /
-`status_segment`. `index` is one read-only tool plus a static context blurb. A
-Rust SDK would grow into these as later extensions need them.
+`status_segment`. `index` is one read-only tool plus a static context blurb.
+terva-extsdk grows into these as later extensions need them (its frame
+vocabulary already covers the full protocol; the runtime adds rows by demand).

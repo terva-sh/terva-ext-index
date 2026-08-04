@@ -1,6 +1,6 @@
 [package]
 name = "terva-ext-index"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "terva index extension: emit a file's tree-sitter skeleton (imports + signatures with exact line ranges) instead of its body"
 license = "MIT"
@@ -11,8 +11,12 @@ name = "terva-ext-index"
 path = "src/main.rs"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# The terva extension runtime: wire framing (4 MiB cap), handshake, Host
+# dirs, the self-Jail, panic-isolated dispatch. A workspace-relative path
+# dependency during SDK co-development; a release tree pins it instead
+# (run.sh refuses to build when the sibling checkout is absent rather than
+# silently falling back to a stale prebuilt).
+terva-extsdk = { git = "https://github.com/terva-sh/terva-sdk-rust", tag = "v0.1.0" }
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-go = "0.25"
@@ -44,8 +48,11 @@ tree-sitter-xml = "0.7.0"
 tree-sitter-html = "0.23.2"
 tree-sitter-css = "0.25.0"
 
-# serde_json is a normal dependency above, so it's already available to the
-# unit and integration tests — no dev-dependency duplicate needed.
+# Test-only since the SDK migration: the binary itself no longer touches
+# JSON (the SDK owns the wire), but the unit tests parse extension.json and
+# the wire smoke test builds/asserts frames.
+[dev-dependencies]
+serde_json = "1"
 
 [profile.release]
 opt-level = 2

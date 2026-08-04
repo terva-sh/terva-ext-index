@@ -1,6 +1,14 @@
 # Proposal: key-outlining for structured-config / data formats + per-file size hints in directory mode
 
-Status: in progress — §4 (directory size hints) implemented on `feat/dir-size-hints`; the §3 format collectors are not yet started
+Status: **implemented** — the whole proposal shipped. §4 (directory size hints)
+in v0.4.0 alongside §3.1 JSON/YAML and §3.2 TOML; the §3 line scanners
+(`.env`, INI, CSV/TSV, logs/text) in v0.5.0. Two later changes are worth knowing
+about when reading the design below: JSON/YAML values under a secret-looking key
+name — or values that betray themselves, like a connection string — are now
+**redacted**, not merely elided by length (see `README.md`); and the backend fork
+of §3.0 landed simpler than sketched, as a fallthrough in `outline_with_depth`
+(try `Lang::from_extension`, else `LineFormat::from_extension`, else
+unsupported) rather than a `Format` enum wrapper.
 Audience: the agent maintaining `terva-ext-index`
 Scope: `src/outline.rs` (the pure walk) and `src/main.rs` (directory mode + dispatch + `STANDING_CONTEXT`)
 

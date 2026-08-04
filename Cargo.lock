@@ -62,6 +62,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
+name = "once_cell"
+version = "1.21.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "pin-project-lite"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -176,11 +188,31 @@ dependencies = [
 ]
 
 [[package]]
-name = "terva-ext-index"
-version = "0.7.0"
+name = "terva-connproto"
+version = "0.1.0"
+source = "git+https://github.com/terva-sh/terva-sdk-rust?tag=v0.1.0#4d239217a434b6372c4dcfc643c4a938d174da2c"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "terva-connsdk"
+version = "0.1.0"
+source = "git+https://github.com/terva-sh/terva-sdk-rust?tag=v0.1.0#4d239217a434b6372c4dcfc643c4a938d174da2c"
+dependencies = [
+ "serde_json",
+ "terva-connproto",
+ "terva-wire",
+ "tracing",
+]
+
+[[package]]
+name = "terva-ext-index"
+version = "0.8.0"
+dependencies = [
+ "serde_json",
+ "terva-extsdk",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c",
@@ -199,6 +231,68 @@ dependencies = [
  "tree-sitter-typescript",
  "tree-sitter-xml",
  "tree-sitter-yaml",
+]
+
+[[package]]
+name = "terva-extproto"
+version = "0.1.0"
+source = "git+https://github.com/terva-sh/terva-sdk-rust?tag=v0.1.0#4d239217a434b6372c4dcfc643c4a938d174da2c"
+dependencies = [
+ "serde",
+ "serde_json",
+ "terva-wire",
+]
+
+[[package]]
+name = "terva-extsdk"
+version = "0.1.0"
+source = "git+https://github.com/terva-sh/terva-sdk-rust?tag=v0.1.0#4d239217a434b6372c4dcfc643c4a938d174da2c"
+dependencies = [
+ "serde_json",
+ "terva-connproto",
+ "terva-connsdk",
+ "terva-extproto",
+ "terva-wire",
+]
+
+[[package]]
+name = "terva-wire"
+version = "0.1.0"
+source = "git+https://github.com/terva-sh/terva-sdk-rust?tag=v0.1.0#4d239217a434b6372c4dcfc643c4a938d174da2c"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "tracing"
+version = "0.1.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
+dependencies = [
+ "pin-project-lite",
+ "tracing-attributes",
+ "tracing-core",
+]
+
+[[package]]
+name = "tracing-attributes"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "tracing-core"
+version = "0.1.36"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
+dependencies = [
+ "once_cell",
 ]
 
 [[package]]
