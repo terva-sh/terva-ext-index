@@ -1,6 +1,6 @@
 [package]
 name = "terva-ext-index"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 description = "terva index extension: emit a file's tree-sitter skeleton (imports + signatures with exact line ranges) instead of its body"
 license = "MIT"
@@ -16,7 +16,7 @@ path = "src/main.rs"
 # dependency during SDK co-development; a release tree pins it instead
 # (run.sh refuses to build when the sibling checkout is absent rather than
 # silently falling back to a stale prebuilt).
-terva-extsdk = { git = "https://github.com/terva-sh/terva-sdk-rust", tag = "v0.2.1" }
+terva-extsdk = { git = "https://github.com/terva-sh/terva-sdk-rust", tag = "v0.3.0" }
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-go = "0.25"

@@ -3,6 +3,21 @@
 Public releases of terva-ext-index. Install with
 `terva ext install https://github.com/terva-sh/terva-ext-index`.
 
+## 0.8.2 — 129 fewer packages to build (2026-08-04)
+
+No behavior change. `run.sh` compiles from source whenever a Rust
+toolchain is present, so this is felt by anyone installing from the
+repo rather than the prebuilt binaries.
+
+- Built against **terva-sdk-rust v0.3.0**, which moves the protocol-5
+  connector carrier behind an off-by-default feature. This extension
+  serves tools and has never carried a connector, but it was linking the
+  connector SDK — and, through its at-rest sealing, `age` — for the role
+  regardless.
+- Measured on a clean release build: **174 → 45 packages** in
+  `Cargo.lock`, and 20s → 12s of compile time here. Slower machines and
+  CI runners should see a wider gap.
+
 ## 0.8.1 — the ext-data declaration (2026-08-04)
 
 - **`"data_secrets": false` in the manifest.** terva now treats an absent

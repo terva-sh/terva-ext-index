@@ -30,7 +30,7 @@ use terva_extsdk::{read_bounded, Authority, Extension, Jail, JailError, Tool, To
 
 /// Kept equal to Cargo.toml's `version` and extension.json's `version` by the
 /// `version_matches_manifests` test below; bump all three together on release.
-const VERSION: &str = "0.8.1";
+const VERSION: &str = "0.8.2";
 
 /// We use the protocol-2 `session_start` event to follow `cwd` across `/cd`
 /// (so the jail tracks the live working directory). That is the lowest host
